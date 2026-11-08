@@ -1,0 +1,8 @@
+/target/
+/dashboard/target/
+*.bak-*
+*.db
+*.db-journal
+*.db-wal
+*.sock
+__pycache__/

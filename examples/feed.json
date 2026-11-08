@@ -1,0 +1,6 @@
+[
+  {
+    "title": "ZFS scrub advisory on storage pool",
+    "regions": ["rack-1"]
+  }
+]

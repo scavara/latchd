@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def now_epoch() -> int:
+    return int(time.time())
+
+
+def home_dir() -> Path:
+    return Path(os.environ.get("HOME", "/tmp"))
+
+
+def handover_dir() -> Path:
+    val = os.environ.get("LATCH_HANDOVER_DIR")
+    if val:
+        p = Path(val)
+    else:
+        p = home_dir() / ".local/state/morning-startup"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def latchd_dir() -> Path:
+    val = os.environ.get("LATCHD_DIR")
+    if val:
+        p = Path(val)
+    else:
+        p = home_dir() / ".local/state/latchd"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def config_dir() -> Path:
+    val = os.environ.get("LATCHBOARD_CONFIG")
+    if val:
+        p = Path(val)
+    else:
+        p = home_dir() / ".config/latchboard"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def latchd_config_dir() -> Path:
+    val = os.environ.get("LATCHD_CONFIG")
+    if val:
+        p = Path(val)
+    else:
+        p = home_dir() / ".config/latchd"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def current_session() -> str:
+    return os.environ.get("LATCH_SESSION", "default")
+
+
+def append_event(kind: str, details: dict) -> None:
+    path = handover_dir() / "events.jsonl"
+    rec = {"ts": now_epoch(), "event": kind, "details": details}
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def parse_time_spec(spec: str, base: int) -> int:
+    s = str(spec).strip()
+    if s.isdigit():
+        val = int(s)
+        return val if val > 1000000000 else base + val
+    if s.startswith("+"):
+        s = s[1:]
+    m = re.fullmatch(r"(\d+)([smhd]?)", s)
+    if not m:
+        raise ValueError(f"invalid time spec: {spec}")
+    num = int(m.group(1))
+    unit = m.group(2) or "m"
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return base + num * mult
+
+
+def load_json_file(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json_file(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def notify_user(title: str, message: str) -> None:
+    if os.environ.get("LATCH_NOTE_NO_NOTIFY") == "1":
+        return
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", title, message], check=False)
+
+
+def find_latchd_bin() -> str:
+    env_bin = os.environ.get("LATCHD_BIN")
+    if env_bin and os.path.exists(env_bin):
+        return env_bin
+    repo_root = Path(__file__).resolve().parent.parent
+    debug_bin = repo_root / "target/debug/latchd"
+    if debug_bin.exists():
+        return str(debug_bin)
+    release_bin = repo_root / "target/release/latchd"
+    if release_bin.exists():
+        return str(release_bin)
+    local_bin = home_dir() / ".local/bin/latchd"
+    if local_bin.exists():
+        return str(local_bin)
+    return "latchd"
+
+
+def cmd_send(args) -> int:
+    note = args.note
+    if note is None:
+        if not sys.stdin.isatty():
+            note = sys.stdin.read().strip()
+        else:
+            note = ""
+    inbox_dir = handover_dir() / "handover" / args.target_loop
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    ts = now_epoch()
+    sender = args.sender or current_session()
+    item = {
+        "ts": ts,
+        "from": sender,
+        "to": args.target_loop,
+        "nodes": args.nodes,
+        "note": note,
+    }
+    fname = f"{ts}-{sender}-{os.getpid()}.json"
+    save_json_file(inbox_dir / fname, item)
+    append_event("handover_send", item)
+    print(f"handed over {', '.join(args.nodes)} to {args.target_loop}")
+    return 0
+
+
+def cmd_inbox(args) -> int:
+    loop_id = args.loop or current_session()
+    inbox_dir = handover_dir() / "handover" / loop_id
+    if not inbox_dir.exists():
+        if args.json:
+            print("[]")
+        return 0
+    files = sorted(inbox_dir.glob("*.json"))
+    items = []
+    for f in files:
+        data = load_json_file(f, None)
+        if data:
+            items.append(data)
+        if args.pop:
+            f.unlink(missing_ok=True)
+    if args.json:
+        print(json.dumps(items, indent=2))
+    else:
+        for it in items:
+            nodes_str = ",".join(it.get("nodes", []))
+            print(f"[{it.get('from')}] nodes={nodes_str} note={it.get('note')}")
+    return 0
+
+
+def cmd_heartbeat(args) -> int:
+    loop_id = args.loop or current_session()
+    now = now_epoch()
+    tick_secs = int(args.tick_secs)
+    expires_at = now + (tick_secs * 2)
+    peers_dir = handover_dir() / "peers"
+    peers_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "loop_id": loop_id,
+        "summary": args.summary,
+        "nodes": args.nodes,
+        "ts": now,
+        "tick_secs": tick_secs,
+        "expires_at": expires_at,
+    }
+    save_json_file(peers_dir / f"{loop_id}.json", payload)
+    save_json_file(peers_dir / f"{loop_id}.state.json", payload)
+    append_event("heartbeat", payload)
+    print(f"heartbeat recorded for {loop_id} ({len(args.nodes)} nodes)")
+    return 0
+
+
+def cmd_directive(args) -> int:
+    now = now_epoch()
+    until_ts = parse_time_spec(args.until, now)
+    from_ts = parse_time_spec(args.from_ts, now) if getattr(args, "from_ts", None) else None
+    d_path = handover_dir() / "directives.json"
+    directives = load_json_file(d_path, [])
+    next_id = max((d.get("id", 0) for d in directives), default=0) + 1
+
+    mode = "block"
+    owner = None
+    prio = None
+    pause_target = None
+
+    if getattr(args, "warn", False):
+        mode = "warn"
+    elif getattr(args, "owner", None):
+        mode = "owner"
+        owner = args.owner
+    elif getattr(args, "min_prio", None) is not None:
+        mode = "min_prio"
+        prio = int(args.min_prio)
+    elif getattr(args, "prio_floor", None) is not None:
+        mode = "prio_floor"
+        prio = int(args.prio_floor)
+    elif getattr(args, "pause", None):
+        mode = "pause"
+        pause_target = args.pause
+
+    rec = {
+        "id": next_id,
+        "text": args.text,
+        "nodes": args.nodes,
+        "mode": mode,
+        "owner": owner,
+        "prio": prio,
+        "pause_target": pause_target,
+        "from_ts": from_ts,
+        "until_ts": until_ts,
+        "announced_start": from_ts is None or from_ts <= now,
+    }
+    directives.append(rec)
+    save_json_file(d_path, directives)
+    append_event("directive", rec)
+    print(f"directive #{next_id} recorded ({mode}) on {', '.join(args.nodes)}")
+    return 0
+
+
+def cmd_maintenance(args) -> int:
+    now = now_epoch()
+    from_ts = parse_time_spec(args.from_ts, now)
+    until_ts = parse_time_spec(args.until, now)
+    d_path = handover_dir() / "directives.json"
+    directives = load_json_file(d_path, [])
+    next_id = max((d.get("id", 0) for d in directives), default=0) + 1
+
+    rec = {
+        "id": next_id,
+        "text": f"maintenance: {args.what}",
+        "nodes": args.nodes,
+        "mode": "block",
+        "owner": args.owner,
+        "prio": None,
+        "pause_target": None,
+        "from_ts": from_ts,
+        "until_ts": until_ts,
+        "announced_start": from_ts <= now,
+    }
+    if args.owner:
+        rec["mode"] = "owner"
+    directives.append(rec)
+    save_json_file(d_path, directives)
+    append_event("maintenance", rec)
+    print(f"maintenance #{next_id} scheduled on {', '.join(args.nodes)}")
+    return 0
+
+
+def cmd_ask(args) -> int:
+    asks_path = handover_dir() / "asks.json"
+    asks = load_json_file(asks_path, [])
+    next_id = max((a.get("id", 0) for a in asks), default=0) + 1
+    rec = {
+        "id": next_id,
+        "loop_id": current_session(),
+        "question": args.question,
+        "nodes": args.nodes,
+        "asked_at": now_epoch(),
+        "answered_at": None,
+        "answer": None,
+    }
+    asks.append(rec)
+    save_json_file(asks_path, asks)
+    notify_user(f"latchboard question #{next_id}", args.question)
+    append_event("ask", rec)
+    print(f"question #{next_id} recorded")
+    return 0
+
+
+def cmd_answered(args) -> int:
+    asks_path = handover_dir() / "asks.json"
+    asks = load_json_file(asks_path, [])
+    qid = int(args.id)
+    found = False
+    for a in asks:
+        if a.get("id") == qid:
+            a["answered_at"] = now_epoch()
+            a["answer"] = args.answer or "acknowledged"
+            found = True
+            break
+    if not found:
+        sys.stderr.write(f"question #{qid} not found\n")
+        return 1
+    save_json_file(asks_path, asks)
+    append_event("answered", {"id": qid, "answer": args.answer})
+    print(f"question #{qid} marked answered")
+    return 0
+
+
+def open_rollouts_db() -> sqlite3.Connection:
+    db_path = handover_dir() / "rollouts.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE IF NOT EXISTS rollouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            phase TEXT NOT NULL DEFAULT 'init',
+            state TEXT NOT NULL DEFAULT 'active',
+            note TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            finished_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS rollout_nodes (
+            rollout_id INTEGER NOT NULL,
+            node TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            note TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (rollout_id, node)
+        );
+        """
+    )
+    return conn
+
+
+def resolve_rollout_id(conn: sqlite3.Connection, ref: str) -> int:
+    if ref.isdigit():
+        row = conn.execute("SELECT id FROM rollouts WHERE id = ?", (int(ref),)).fetchone()
+        if row:
+            return int(row["id"])
+    row = conn.execute(
+        "SELECT id FROM rollouts WHERE name = ? ORDER BY id DESC LIMIT 1", (ref,)
+    ).fetchone()
+    if not row:
+        raise ValueError(f"rollout not found: {ref}")
+    return int(row["id"])
+
+
+def cmd_rollout(args) -> int:
+    conn = open_rollouts_db()
+    now = now_epoch()
+    sub = args.rollout_cmd
+
+    if sub == "start":
+        owner = args.owner or os.environ.get("LATCH_SESSION") or f"session: {os.environ.get('LATCH_TITLE', 'manual')}"
+        cur = conn.execute(
+            "INSERT INTO rollouts (name, owner, phase, state, note, created_at, updated_at) VALUES (?, ?, ?, 'active', '', ?, ?)",
+            (args.name, owner, args.phase or "init", now, now),
+        )
+        rid = cur.lastrowid
+        for n in args.nodes:
+            conn.execute(
+                "INSERT OR REPLACE INTO rollout_nodes (rollout_id, node, status, note, updated_at) VALUES (?, ?, 'pending', '', ?)",
+                (rid, n, now),
+            )
+        conn.commit()
+        append_event("rollout_start", {"id": rid, "name": args.name, "owner": owner, "nodes": args.nodes})
+        print(f"rollout #{rid} ({args.name}) started by {owner}")
+        return 0
+
+    if sub == "mark":
+        rid = resolve_rollout_id(conn, args.rollout)
+        conn.execute(
+            "INSERT INTO rollout_nodes (rollout_id, node, status, note, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(rollout_id, node) DO UPDATE SET status=excluded.status, note=excluded.note, updated_at=excluded.updated_at",
+            (rid, args.node, args.status, args.note or "", now),
+        )
+        conn.execute("UPDATE rollouts SET updated_at = ? WHERE id = ?", (now, rid))
+        conn.commit()
+        print(f"rollout #{rid}: {args.node} -> {args.status}")
+        return 0
+
+    if sub == "phase":
+        rid = resolve_rollout_id(conn, args.rollout)
+        conn.execute("UPDATE rollouts SET phase = ?, updated_at = ? WHERE id = ?", (args.phase, now, rid))
+        conn.commit()
+        print(f"rollout #{rid} phase -> {args.phase}")
+        return 0
+
+    if sub == "note":
+        rid = resolve_rollout_id(conn, args.rollout)
+        conn.execute("UPDATE rollouts SET note = ?, updated_at = ? WHERE id = ?", (args.text, now, rid))
+        conn.commit()
+        print(f"rollout #{rid} note updated")
+        return 0
+
+    if sub == "state":
+        rid = resolve_rollout_id(conn, args.rollout)
+        fin = now if args.state in ("done", "aborted") else None
+        conn.execute(
+            "UPDATE rollouts SET state = ?, updated_at = ?, finished_at = ? WHERE id = ?",
+            (args.state, now, fin, rid),
+        )
+        conn.commit()
+        print(f"rollout #{rid} state -> {args.state}")
+        return 0
+
+    if sub == "ls":
+        cutoff = now - 86400
+        if args.all:
+            rows = conn.execute("SELECT * FROM rollouts ORDER BY id DESC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM rollouts WHERE state = 'active' OR (finished_at IS NOT NULL AND finished_at >= ?) ORDER BY id DESC",
+                (cutoff,),
+            ).fetchall()
+        for r in rows:
+            counts = conn.execute(
+                "SELECT status, COUNT(*) as cnt FROM rollout_nodes WHERE rollout_id = ? GROUP BY status",
+                (r["id"],),
+            ).fetchall()
+            summary = ",".join(f"{c['status']}:{c['cnt']}" for c in counts) or "no-nodes"
+            print(f"#{r['id']} {r['name']} [{r['state']}/{r['phase']}] owner={r['owner']} ({summary})")
+        return 0
+
+    if sub == "show":
+        rid = resolve_rollout_id(conn, args.rollout)
+        r = conn.execute("SELECT * FROM rollouts WHERE id = ?", (rid,)).fetchone()
+        nodes = conn.execute(
+            "SELECT node, status, note, updated_at FROM rollout_nodes WHERE rollout_id = ? ORDER BY node",
+            (rid,),
+        ).fetchall()
+        payload = {
+            "id": r["id"],
+            "name": r["name"],
+            "owner": r["owner"],
+            "phase": r["phase"],
+            "state": r["state"],
+            "note": r["note"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "finished_at": r["finished_at"],
+            "nodes": [dict(n) for n in nodes],
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"Rollout #{r['id']}: {r['name']} ({r['state']}) phase={r['phase']} owner={r['owner']}")
+            if r["note"]:
+                print(f"Note: {r['note']}")
+            for n in nodes:
+                suffix = f" ({n['note']})" if n["note"] else ""
+                print(f"  {n['node']}: {n['status']}{suffix}")
+        return 0
+
+    return 1
+
+
+def parse_nodes_config() -> dict:
+    groups = {}
+    for base in (config_dir(), latchd_config_dir()):
+        p = base / "nodes"
+        if not p.exists():
+            continue
+        current = "default"
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current = line[1:-1].strip()
+                groups.setdefault(current, {"globs": [], "sources": [], "regions": []})
+                continue
+            groups.setdefault(current, {"globs": [], "sources": [], "regions": []})
+            if "=" in line:
+                k, v = [x.strip() for x in line.split("=", 1)]
+                items = [x.strip() for x in v.split(",") if x.strip()]
+                if k in ("globs", "nodes"):
+                    groups[current]["globs"].extend(items)
+                elif k == "sources":
+                    groups[current]["sources"].extend(items)
+                elif k == "regions":
+                    groups[current]["regions"].extend(items)
+            else:
+                groups[current]["globs"].append(line.split()[0])
+    return groups
+
+
+def expand_node_globs(globs: list) -> list:
+    latchd = find_latchd_bin()
+    matched = set()
+    for g in globs:
+        res = subprocess.run([latchd, "nodes", g], capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if line.strip():
+                    matched.add(line.strip())
+    return sorted(matched)
+
+
+def cmd_nodes_check(_args) -> int:
+    groups = parse_nodes_config()
+    if not groups:
+        sys.stderr.write("no node groups found\n")
+        return 1
+    for name, cfg in groups.items():
+        if not cfg["globs"]:
+            sys.stderr.write(f"group [{name}] missing globs/nodes\n")
+            return 1
+    print(f"validated {len(groups)} group(s)")
+    return 0
+
+
+def cmd_notices_fetch(_args) -> int:
+    groups = parse_nodes_config()
+    notices = []
+    for group_name, cfg in groups.items():
+        likely_nodes = expand_node_globs(cfg.get("globs", []))
+        for src in cfg.get("sources", []):
+            src_path = Path(src)
+            if not src_path.is_absolute():
+                src_path = config_dir() / src
+            if not src_path.exists():
+                continue
+            raw = src_path.read_text(encoding="utf-8").strip()
+            if src_path.suffix == ".json":
+                items = json.loads(raw)
+                if isinstance(items, dict):
+                    items = [items]
+                for it in items:
+                    notices.append(
+                        {
+                            "provider": group_name,
+                            "title": it.get("title", "advisory"),
+                            "regions": it.get("regions", cfg.get("regions", [])),
+                            "nodes": likely_nodes,
+                            "ts": it.get("ts", now_epoch()),
+                        }
+                    )
+            else:
+                root = ET.fromstring(raw)
+                for elem in root.iter():
+                    if elem.tag.endswith("item") or elem.tag.endswith("entry"):
+                        title = "advisory"
+                        for child in elem:
+                            if child.tag.endswith("title") and child.text:
+                                title = child.text.strip()
+                        notices.append(
+                            {
+                                "provider": group_name,
+                                "title": title,
+                                "regions": cfg.get("regions", []),
+                                "nodes": likely_nodes,
+                                "ts": now_epoch(),
+                            }
+                        )
+    out_path = handover_dir() / "notices.json"
+    save_json_file(out_path, notices)
+    print(f"fetched {len(notices)} notice(s)")
+    return 0
+
+
+def load_node_regex() -> re.Pattern:
+    for base in (latchd_config_dir(), config_dir()):
+        re_file = base / "node-re"
+        if re_file.exists():
+            pat = re_file.read_text(encoding="utf-8").strip()
+            if pat:
+                return re.compile(r"\b(?:" + pat + r")\b")
+    known = expand_node_globs(["*"])
+    if known:
+        escaped = "|".join(re.escape(x) for x in known)
+        return re.compile(r"\b(?:" + escaped + r")\b")
+    return re.compile(r"\b(?:ab\d{4}|testhost-[a-z0-9]+|node-[a-z0-9]+)\b")
+
+
+def strip_ignored_segments(cmd: str) -> str:
+    cleaned = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?.*?\1", "", cmd, flags=re.DOTALL)
+    segments = re.split(r"(?:&&|\|\||;|\|)", cleaned)
+    kept = []
+    readonly_prefixes = (
+        "latch-note",
+        "echo ",
+        "printf ",
+        "cat <<",
+        "true",
+        "false",
+    )
+    for seg in segments:
+        s = seg.strip()
+        if not s:
+            continue
+        if any(s == p.strip() or s.startswith(p) for p in readonly_prefixes):
+            continue
+        kept.append(s)
+    return " ; ".join(kept)
+
+
+def cmd_hook(args) -> int:
+    sub = args.hook_cmd
+    session = args.session or current_session()
+    prio = str(args.prio or os.environ.get("LATCH_PRIO", "5"))
+    latchd = find_latchd_bin()
+
+    if sub == "pre-command":
+        cmd_text = args.command
+        if not cmd_text and not sys.stdin.isatty():
+            raw = sys.stdin.read().strip()
+            if raw.startswith("{"):
+                data = json.loads(raw)
+                cmd_text = (
+                    data.get("tool_input", {}).get("command")
+                    or data.get("command")
+                    or ""
+                )
+            else:
+                cmd_text = raw
+        cmd_text = cmd_text or ""
+        inspect_text = strip_ignored_segments(cmd_text)
+        if not inspect_text:
+            return 0
+        rx = load_node_regex()
+        found_nodes = sorted(set(rx.findall(inspect_text)))
+        for node in found_nodes:
+            res = subprocess.run(
+                [latchd, "claim", node, "--holder", session, "-p", prio],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if res.returncode != 0:
+                sys.stderr.write(res.stderr or f"latchd refused claim on {node}\n")
+                return 2
+        return 0
+
+    if sub == "prompt":
+        prompt_text = args.text
+        if not prompt_text and not sys.stdin.isatty():
+            raw = sys.stdin.read().strip()
+            if raw.startswith("{"):
+                data = json.loads(raw)
+                if data.get("source") in ("peer", "runner", "loop_prompt"):
+                    return 0
+                prompt_text = data.get("prompt") or data.get("text") or ""
+            else:
+                prompt_text = raw
+        prompt_text = prompt_text or ""
+        rx = load_node_regex()
+        for node in sorted(set(rx.findall(prompt_text))):
+            subprocess.run(
+                [latchd, "grant-take", node, "--session", session],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        return 0
+
+    if sub == "state":
+        peers_dir = handover_dir() / "peers"
+        peers_dir.mkdir(parents=True, exist_ok=True)
+        state_file = peers_dir / f"{session}.state.json"
+        existing = load_json_file(state_file, {"loop_id": session, "nodes": []})
+        existing["updated_at"] = now_epoch()
+        existing["status"] = args.status or "active"
+        save_json_file(state_file, existing)
+        return 0
+
+    return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="latch-note")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_send = sub.add_parser("send")
+    p_send.add_argument("target_loop")
+    p_send.add_argument("nodes", nargs="+")
+    p_send.add_argument("--note", default=None)
+    p_send.add_argument("--from", dest="sender", default=None)
+
+    p_inbox = sub.add_parser("inbox")
+    p_inbox.add_argument("loop", nargs="?", default=None)
+    p_inbox.add_argument("--pop", action="store_true")
+    p_inbox.add_argument("--json", action="store_true")
+
+    p_hb = sub.add_parser("heartbeat")
+    p_hb.add_argument("summary")
+    p_hb.add_argument("nodes", nargs="*")
+    p_hb.add_argument("--loop", default=None)
+    p_hb.add_argument("--tick-secs", default=900, type=int)
+
+    p_dir = sub.add_parser("directive")
+    p_dir.add_argument("text")
+    p_dir.add_argument("nodes", nargs="+")
+    p_dir.add_argument("--until", required=True)
+    p_dir.add_argument("--from", dest="from_ts", default=None)
+    p_dir.add_argument("--block", action="store_true")
+    p_dir.add_argument("--warn", action="store_true")
+    p_dir.add_argument("--owner", default=None)
+    p_dir.add_argument("--min-prio", type=int, default=None)
+    p_dir.add_argument("--prio-floor", type=int, default=None)
+    p_dir.add_argument("--pause", default=None)
+
+    p_maint = sub.add_parser("maintenance")
+    p_maint.add_argument("what")
+    p_maint.add_argument("nodes", nargs="+")
+    p_maint.add_argument("--from", dest="from_ts", required=True)
+    p_maint.add_argument("--until", required=True)
+    p_maint.add_argument("--owner", default=None)
+
+    p_ask = sub.add_parser("ask")
+    p_ask.add_argument("question")
+    p_ask.add_argument("nodes", nargs="*")
+
+    p_ans = sub.add_parser("answered")
+    p_ans.add_argument("id")
+    p_ans.add_argument("answer", nargs="?", default="answered")
+
+    p_roll = sub.add_parser("rollout")
+    rsub = p_roll.add_subparsers(dest="rollout_cmd", required=True)
+
+    r_start = rsub.add_parser("start")
+    r_start.add_argument("name")
+    r_start.add_argument("nodes", nargs="*")
+    r_start.add_argument("--owner", default=None)
+    r_start.add_argument("--phase", default="init")
+
+    r_mark = rsub.add_parser("mark")
+    r_mark.add_argument("rollout")
+    r_mark.add_argument("node")
+    r_mark.add_argument("status")
+    r_mark.add_argument("--note", default="")
+
+    r_phase = rsub.add_parser("phase")
+    r_phase.add_argument("rollout")
+    r_phase.add_argument("phase")
+
+    r_note = rsub.add_parser("note")
+    r_note.add_argument("rollout")
+    r_note.add_argument("text")
+
+    r_state = rsub.add_parser("state")
+    r_state.add_argument("rollout")
+    r_state.add_argument("state", choices=["active", "done", "aborted", "paused"])
+
+    r_ls = rsub.add_parser("ls")
+    r_ls.add_argument("--all", action="store_true")
+
+    r_show = rsub.add_parser("show")
+    r_show.add_argument("rollout")
+    r_show.add_argument("--json", action="store_true")
+
+    p_notices = sub.add_parser("notices")
+    nsub = p_notices.add_subparsers(dest="notices_cmd", required=True)
+    nsub.add_parser("fetch")
+
+    p_nodes = sub.add_parser("nodes")
+    ndsub = p_nodes.add_subparsers(dest="nodes_cmd", required=True)
+    ndsub.add_parser("check")
+
+    p_hook = sub.add_parser("hook")
+    hsub = p_hook.add_subparsers(dest="hook_cmd", required=True)
+
+    h_pre = hsub.add_parser("pre-command")
+    h_pre.add_argument("--command", default=None)
+    h_pre.add_argument("--session", default=None)
+    h_pre.add_argument("--prio", default=None)
+
+    h_prompt = hsub.add_parser("prompt")
+    h_prompt.add_argument("--text", default=None)
+    h_prompt.add_argument("--session", default=None)
+
+    h_state = hsub.add_parser("state")
+    h_state.add_argument("--session", default=None)
+    h_state.add_argument("--status", default="active")
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    dispatch = {
+        "send": cmd_send,
+        "inbox": cmd_inbox,
+        "heartbeat": cmd_heartbeat,
+        "directive": cmd_directive,
+        "maintenance": cmd_maintenance,
+        "ask": cmd_ask,
+        "answered": cmd_answered,
+        "rollout": cmd_rollout,
+        "notices": cmd_notices_fetch,
+        "nodes": cmd_nodes_check,
+        "hook": cmd_hook,
+    }
+    return dispatch[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
