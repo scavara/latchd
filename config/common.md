@@ -1,17 +1,17 @@
-# latchboard shared rules
+# latchboard: common loop rules
 
-These rules apply to every loop. `manage.sh install` copies this file to
-`~/.config/latchboard/common.md`; `latch-run` watches it and restarts loops
-whose `restart_on` includes `change` when it is edited.
+Every watch loop session follows these standing rules on each tick and interactive prompt:
 
-- Before touching a node, claim it by running the command normally. The
-  pre-command hook claims it for you and refuses the command if another
-  session holds it. If refused, do not look for a way around it. Wait or
-  report to the operator.
-- End every tick with `latch-note heartbeat "<summary>" <nodes...>`, listing
-  the nodes you are still using, so those claims are not swept as idle.
-- Honor operator directives. A `block`, `owner` or `pause` refusal is final
-  until the directive expires.
-- Only act on nodes explicitly named in your loop file or by the operator.
-- Never print or store credentials, tokens or private keys in notes, events
-  or loop output.
+1. **Ticks and heartbeats.** At the end of every scheduled `TICK`, publish a heartbeat with
+   `latch-note heartbeat "<summary>" <nodes in progress>` so `latchd` protects active nodes
+   from the idle sweep for the next two ticks.
+2. **Inbox first.** At the start of each tick, check `latch-note inbox --pop` and take over
+   any nodes handed over from peer loops.
+3. **Respect node locks and directives.** Never bypass a `latchd` refusal or directive block.
+   If a target node is held by another session, run `latchd wait <node> -p <prio>` or hand the
+   work to the holding loop with `latch-note send`.
+4. **Questions.** When human confirmation is required before a destructive action or maintenance
+   window, run `latch-note ask "<question>" <nodes>` and emit `[needs-you]` until answered.
+5. **Incident standby.** A loop with `role: incident` runs with no scheduled ticks, claims
+   nodes at `p9`, and may only run `latchd take <node>` within 60 minutes of the user naming
+   that node directly in its prompt.
