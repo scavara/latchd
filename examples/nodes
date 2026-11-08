@@ -1,0 +1,8 @@
+[storage]
+globs = ab1001, ab1002
+sources = feed.json
+regions = rack-1
+
+[compute]
+globs = testhost-a, testhost-b
+regions = rack-2

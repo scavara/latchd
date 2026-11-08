@@ -1,0 +1,3 @@
+terminal = tmux
+rollouts_recent = 1d
+notice_poll = 30m

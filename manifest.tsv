@@ -1,0 +1,2 @@
+bin/latch-note	.local/bin/latch-note	0755
+config/common.md	.config/latchboard/common.md	0644
