@@ -612,7 +612,7 @@ def strip_ignored_segments(cmd: str) -> str:
 def cmd_hook(args) -> int:
     sub = args.hook_cmd
     session = args.session or current_session()
-    prio = str(args.prio or os.environ.get("LATCH_PRIO", "5"))
+    prio = str(getattr(args, "prio", None) or os.environ.get("LATCH_PRIO", "5"))
     latchd = find_latchd_bin()
 
     if sub == "pre-command":
