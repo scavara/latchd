@@ -1,4 +1,4 @@
-# latchboard
+# latchd
 
 Node claims, priorities and agent "loops" for a homelab, so that several
 autonomous CLI agent sessions can work on the same machines without stepping
@@ -6,7 +6,7 @@ on each other.
 
 If you run more than one agent session (for example [Claude Code](https://claude.com/claude-code))
 against a shared set of hosts, two of them will eventually `ssh` into the same
-box at the same time. latchboard makes that a managed situation instead of a
+box at the same time. latchd makes that a managed situation instead of a
 race: a session must *claim* a node before touching it, waiters queue by
 priority, idle claims are released automatically, and an operator can issue
 directives (block, warn, reserve, pause) that every session obeys.
@@ -80,7 +80,7 @@ Check ZFS pool health and SMART counters on storage nodes.
 
 Samples are in [`examples/`](examples/). The agent command defaults to
 `claude`; set `LATCH_AGENT_BIN` (or a `runner:` header) to use another CLI.
-Shared rules for every loop live in `~/.config/latchboard/common.md`
+Shared rules for every loop live in `~/.config/latchd/common.md`
 (source: [`config/common.md`](config/common.md)); editing it restarts running
 loops that opted into `change`.
 
@@ -89,9 +89,9 @@ loops that opted into `change`.
 | Variable | Default | Purpose |
 |---|---|---|
 | `LATCHD_DIR` | `~/.local/state/latchd` | `claims.db` and `events.jsonl` |
-| `LATCHBOARD_STATE_DIR` | `~/.local/state/latchboard` | Runner sockets and state |
+| `LATCHBOARD_STATE_DIR` | `~/.local/state/latchd` | Runner sockets and state |
 | `LATCH_HANDOVER_DIR` | `~/.local/state/morning-startup` | Directives, peers, notices |
-| `LATCHBOARD_CONFIG` / `LATCHD_CONFIG` | `~/.config/latchboard` / `~/.config/latchd` | `nodes`, `loops/`, `common.md` |
+| `LATCHBOARD_CONFIG` / `LATCHD_CONFIG` | `~/.config/latchd` / `~/.config/latchd` | `nodes`, `loops/`, `common.md` |
 | `LATCH_AGENT_BIN` | `claude` | Agent executable the runner launches |
 
 ## Status
