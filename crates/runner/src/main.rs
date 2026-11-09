@@ -9,7 +9,7 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
@@ -30,7 +30,7 @@ struct LoopSpec {
     prompt: String,
 }
 
-fn file_Fingerprint(path: &Path) -> u64 {
+fn file_fingerprint(path: &Path) -> u64 {
     let Ok(meta) = fs::metadata(path) else {
         return 0;
     };
@@ -332,9 +332,9 @@ fn main() {
     let pending_restart: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from(""));
-    let mut loop_fp = file_Fingerprint(&spec.path);
-    let mut common_fp = file_Fingerprint(&common_md_path());
-    let mut bin_fp = file_Fingerprint(&exe_path);
+    let mut loop_fp = file_fingerprint(&spec.path);
+    let mut common_fp = file_fingerprint(&common_md_path());
+    let mut bin_fp = file_fingerprint(&exe_path);
 
     let (mut child, io_pair) = match spawn_session_pty(&spec) {
         Ok(pair) => pair,
@@ -468,9 +468,9 @@ fn main() {
             save_registry(&st);
         }
 
-        let new_loop_fp = file_Fingerprint(&spec.path);
-        let new_common_fp = file_Fingerprint(&common_md_path());
-        let new_bin_fp = file_Fingerprint(&exe_path);
+        let new_loop_fp = file_fingerprint(&spec.path);
+        let new_common_fp = file_fingerprint(&common_md_path());
+        let new_bin_fp = file_fingerprint(&exe_path);
 
         if (new_loop_fp != loop_fp || new_common_fp != common_fp)
             && spec.restart_on.iter().any(|r| r == "change")
