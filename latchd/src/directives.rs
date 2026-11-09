@@ -15,6 +15,7 @@ pub fn load_directives() -> Vec<Directive> {
     serde_json::from_str(&data).unwrap_or_default()
 }
 
+#[allow(dead_code)]
 pub fn save_directives(list: &[Directive]) -> std::io::Result<()> {
     let path = directives_path();
     if let Some(parent) = path.parent() {
