@@ -1,4 +1,4 @@
-# Latchboard Roadmap & TODOs
+# Latchd Roadmap & TODOs
 
 This project is under active development. The core daemon, locking engine, and TUI are functional, but several operational features are planned for the upcoming sprints.
 
@@ -8,7 +8,7 @@ This project is under active development. The core daemon, locking engine, and T
 - [ ] **Priority-Floor Expiry Cleanup:** Implement automatic timestamp expiration and cleanup for `prio_floor` directives inside the `latchd/src/directives.rs` state engine.
 - [ ] **Stale Socket Sweeps:** Add a cleanup routine in `latch-up` (the launcher) to detect and remove orphaned `.sock` files when a runner PID dies unexpectedly.
 - [ ] **Notice Filtering by Node:** Expand the `latch-note notices` CLI to allow filtering cached hardware/upstream notices by specific target nodes (e.g., `latch-note notices list --node ab1001`).
-- [ ] **Dashboard Color Coding:** Upgrade the read-only `ratatui` dashboard (`latchboard`) to use priority-based color coding for the active claims list, making high-priority/incident holds visually distinct.
+- [ ] **Dashboard Color Coding:** Upgrade the read-only `ratatui` dashboard (`latchd`) to use priority-based color coding for the active claims list, making high-priority/incident holds visually distinct.
 
 ## Core Operational Principles
 

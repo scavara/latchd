@@ -1,6 +1,6 @@
-# latchboard architecture overview
+# latchd architecture overview
 
-latchboard has two jobs: keep concurrent agent sessions from colliding on the
+latchd has two jobs: keep concurrent agent sessions from colliding on the
 same machine, and keep those sessions running on a schedule.
 
 ```

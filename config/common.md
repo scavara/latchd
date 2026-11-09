@@ -1,4 +1,4 @@
-# latchboard: common loop rules
+# latchd: common loop rules
 
 Every watch loop session follows these standing rules on each tick and interactive prompt:
 

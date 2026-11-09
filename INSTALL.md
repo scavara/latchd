@@ -1,4 +1,4 @@
-# latchboard: installation guide for agents
+# latchd: installation guide for agents
 
 1. Verify environment prerequisites: Python 3.9+ (stdlib only), Rust 1.78+ (required for lockfile v4).
 2. Run test suite: `./tests/run.sh`
