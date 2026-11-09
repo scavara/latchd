@@ -1,4 +1,4 @@
-# latchboard: common tick rules
+# latchd: common tick rules
 
 Every watch tick session follows these standing rules on each tick and interactive prompt:
 
