@@ -1,4 +1,4 @@
-# Latchd Roadmap & TODOs
+# latchd Roadmap & TODOs
 
 This project is under active development. The core daemon, locking engine, and TUI are functional, but several operational features are planned for the upcoming sprints.
 
@@ -7,12 +7,22 @@ This project is under active development. The core daemon, locking engine, and T
 - [ ] **JSON Export for Rollouts:** Add a `--json` flag to `latch-note rollout show` to enable automated parsing of active rollout states by external monitoring scripts.
 - [ ] **Priority-Floor Expiry Cleanup:** Implement automatic timestamp expiration and cleanup for `prio_floor` directives inside the `latchd/src/directives.rs` state engine.
 - [ ] **Stale Socket Sweeps:** Add a cleanup routine in `latch-up` (the launcher) to detect and remove orphaned `.sock` files when a runner PID dies unexpectedly.
-- [ ] **Notice Filtering by Node:** Expand the `latch-note notices` CLI to allow filtering cached hardware/upstream notices by specific target nodes (e.g., `latch-note notices list --node ab1001`).
-- [ ] **Dashboard Color Coding:** Upgrade the read-only `ratatui` dashboard (`latchd`) to use priority-based color coding for the active claims list, making high-priority/incident holds visually distinct.
+- [ ] **Notice Filtering by Node:** Expand the `latch-note notices` CLI to allow filtering cached hardware/upstream notices by specific target nodes.
+- [ ] **Dashboard Color Coding:** Upgrade the read-only `ratatui` dashboard to use priority-based color coding for the active claims list.
+
+## Phase 2: Advanced Coordination & UI
+
+- [ ] **TUI Slash Commands & Navigation:** Implement interactive slash commands in the dashboard (e.g., `/shutdown N|all`, `/close ro`) and single-key panel focus shortcuts (`d`, `o`, `m`, `h`, `w`, `n`).
+- [ ] **FCFS Queue & Takeover Negotiation:** Refactor the `latchd` queue to operate on a First-Come-First-Served basis. Standard ticks must ask the current holder before taking over, waiting for a `latchd reply <host> yes|no --eta` response (or timing out after 15 minutes to ask the user).
+- [ ] **Incident Tick Supremacy:** Allow incident ticks to automatically take hosts from standard ticks without asking. Make hosts held by incident ticks strictly off-limits (no session can take them, and incident ticks are never asked to yield). Support multiple concurrent incident ticks.
+- [ ] **Per-Tick Configuration:** Support `mcp_config`, `model`, and `effort` overrides per-tick in the configuration file to allow sharing resources (like specific MCP servers).
+- [ ] **Session Audit Log (`latch-note said`):** Add a command to export user prompts typed in tick tabs and answers to tick questions for local auditing, logging up to 400 characters.
+- [ ] **Pre-Action Maintenance Checks:** Add a `latch-note digest` hook for ticks to query a generic upstream maintenance digest before allowing them to automatically blame, restart, reboot, or escalate a host.
+- [ ] **Directive Sync Service:** Add a `latch-note directive sync` mechanism to keep active directives tied strictly to the presence of specific hosts, expiring 26 hours after the last sync.
 
 ## Core Operational Principles
 
 - **State Independence:** The dashboard must remain strictly read-only, reading runtime state passively. Any state mutations must be delegated through established CLIs (`latch-note`, `latch-run`, `latch-up`, or `latchd`) rather than modifying runtime JSON directly.
-- **Resilience:** The UI must handle missing, malformed, locked, or newer-than-known data gracefully. A single corrupt data source must not crash the entire dashboard.
-- **Lifecycle Coordination:** Tick restarts must follow the supported launcher/runner lifecycle path, allowing active ticks to finish and preserving handover information, rather than aggressively terminating processes.
-- **Fixture Determinism:** All tests must continue to use synthetic fixtures and backdated timestamps, overriding state directories to temporary paths instead of interacting with live local state.
+- **Resilience:** The UI must handle missing, malformed, locked, or newer-than-known data gracefully.
+- **Lifecycle Coordination:** Tick restarts must follow the supported launcher/runner lifecycle path, allowing active ticks to finish and preserving handover information.
+- **Fixture Determinism:** All tests must continue to use synthetic fixtures and backdated timestamps, overriding state directories to temporary paths.

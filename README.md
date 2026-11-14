@@ -105,3 +105,7 @@ Early (`latchd` 0.3.x).
 ## Dashboard Overview
 
 ![Dashboard Preview](docs/assets/dashboard-preview.jpg)
+
+## Session Management
+
+![Tmux Session Preview](docs/assets/tmux-preview.jpg)
