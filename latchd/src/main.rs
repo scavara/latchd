@@ -294,7 +294,7 @@ fn main() {
                 }
             }
         }
-        "daemon" => tick {
+        "daemon" => loop {
             let _ = daemon::run_sweep(&conn);
             thread::sleep(Duration::from_secs(15));
         },

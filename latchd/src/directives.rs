@@ -94,7 +94,7 @@ pub fn check_node_directives(
             DirectiveMode::Pause => {
                 if let Some(ref target) = d.pause_target {
                     if target == "all" || target == holder {
-                        return Err(format!("directive #{}: tick {} paused", d.id, holder));
+                        return Err(format!("directive #{}: loop {} paused", d.id, holder));
                     }
                 }
             }

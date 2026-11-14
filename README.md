@@ -17,9 +17,10 @@ directives (block, warn, reserve, pause) that every session obeys.
 |---|---|---|
 | `latchd` | Rust + SQLite | Claim/queue/take-grant store, directive checks, idle sweeper (`latchd daemon`) |
 | `latch-run` | Rust | Runs one tick file as an agent session in a PTY, with a control socket and restart-on-change |
-| `latch-up` | Rust | Starts, stops, pauses and ticks ticks (`latch-up start all`, `latch-up status`) |
+| `latch-up` | Rust | Starts, stops, pauses and triggers ticks (`latch-up start all`, `latch-up status`) |
 | `latch-note` | Python 3 (stdlib only) | Session notes, heartbeats, directives, maintenance windows, rollouts, advisory feeds, and the Claude Code hooks |
-| `dashboard/` | Rust + ratatui | Terminal snapshot of claims, rollouts and runners (`--once` for plain text) |
+| `dashboard/` (`latchboard`) | Rust + ratatui | Multi-panel terminal dashboard of claims, rollouts, runners, notices, host queues and directives (`--once` for plain text) |
+| `start-ticks.sh` | bash + tmux | Orchestrates all active ticks and `latchboard` in a top-tabbed `tmux` session (`--restart`, `--stop`, `--status`) |
 
 See [OVERVIEW.md](OVERVIEW.md) for how the pieces fit together.
 
@@ -28,7 +29,7 @@ See [OVERVIEW.md](OVERVIEW.md) for how the pieces fit together.
 - A Unix-like OS (uses Unix sockets, PTYs and `kill(2)`)
 - Rust stable, **1.78 or newer** (the lockfiles are format version 4)
 - Python 3.9+ (standard library only)
-- bash
+- bash and `tmux`
 
 ## Build, test, install
 
@@ -37,6 +38,13 @@ See [OVERVIEW.md](OVERVIEW.md) for how the pieces fit together.
 ./install.sh all      # release build -> ~/.local/bin (latchd, latch-run, latch-up)
 ./manage.sh install   # copies latch-note and config/common.md into place
 ./manage.sh hooks     # merges hooks/claude-hooks.json into ~/.claude/settings.json
+./deploy.sh           # builds and installs the full suite + latchboard + start-ticks.sh
+```
+
+Or run the full test, release build, and deployment pipeline in one line:
+
+```bash
+cargo test && ./tests/run.sh && cargo build --release && ./deploy.sh
 ```
 
 `install.sh` runs the tests first; set `LATCH_SKIP_TESTS=1` to skip them.
@@ -78,18 +86,27 @@ agent_args: --quiet
 Check ZFS pool health and SMART counters on storage nodes.
 ```
 
-Samples are in [`examples/`](examples/). The agent command defaults to
+Samples are in [`examples/ticks/`](examples/ticks/). The agent command defaults to
 `claude`; set `LATCH_AGENT_BIN` (or a `runner:` header) to use another CLI.
 Shared rules for every tick live in `~/.config/latchd/common.md`
 (source: [`config/common.md`](config/common.md)); editing it restarts running
 ticks that opted into `change`.
+
+To launch all ticks in background tabs alongside the interactive `latchboard` TUI:
+
+```bash
+start-ticks.sh            # start or attach to the latchd-ticks tmux session
+start-ticks.sh --status   # list active tick windows
+start-ticks.sh --restart  # cleanly restart all runners and the tmux session
+start-ticks.sh --stop     # stop all runners and clean up sockets/state
+```
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `LATCHD_DIR` | `~/.local/state/latchd` | `claims.db` and `events.jsonl` |
-| `LATCHBOARD_STATE_DIR` | `~/.local/state/latchd` | Runner sockets and state |
+| `LATCHBOARD_STATE_DIR` | `~/.local/state/latchboard` | Runner sockets and state |
 | `LATCH_HANDOVER_DIR` | `~/.local/state/latchd-up` | Directives, peers, notices |
 | `LATCHBOARD_CONFIG` / `LATCHD_CONFIG` | `~/.config/latchd` / `~/.config/latchd` | `nodes`, `ticks/`, `common.md` |
 | `LATCH_AGENT_BIN` | `claude` | Agent executable the runner launches |

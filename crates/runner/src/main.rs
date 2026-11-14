@@ -326,6 +326,9 @@ fn main() {
         socket_path: sock_path.to_string_lossy().to_string(),
     };
     save_registry(&initial_state);
+    println!("[latch-run] started tick '{}' ({}) | pid={} | every={:?}s | socket={}",
+        initial_state.tick_id, initial_state.title, initial_state.pid,
+        initial_state.every_secs, initial_state.socket_path);
 
     let shared_state = Arc::new(Mutex::new(initial_state));
     let pending_ticks = Arc::new(Mutex::new(0u32));
@@ -355,11 +358,13 @@ fn main() {
     let mut reader = io_pair.reader;
     thread::spawn(move || {
         let mut buf = [0u8; 1024];
-        tick {
+        loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     let text = String::from_utf8_lossy(&buf[..n]);
+                    print!("{}", text);
+                    let _ = std::io::stdout().flush();
                     if text.contains("NEEDS_YOU")
                         || text.contains("[needs-you]")
                         || text.contains("waiting for user")
@@ -375,7 +380,7 @@ fn main() {
         }
     });
 
-    tick {
+    loop {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut req_buf = String::new();
             let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
