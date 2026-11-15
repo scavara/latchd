@@ -6,7 +6,7 @@ LATCH_RUN="$ROOT_DIR/target/debug/latch-run"
 LATCH_UP="$ROOT_DIR/target/debug/latch-up"
 
 SCRATCH="$(mktemp -d)"
-trap 'rm -rf "$SCRATCH"' EXIT
+trap '"$LATCH_UP" stop all >/dev/null 2>&1 || true; rm -rf "$SCRATCH"' EXIT
 
 export LATCHD_DIR="$SCRATCH/latchd"
 export LATCH_HANDOVER_DIR="$SCRATCH/handover"
@@ -31,6 +31,7 @@ done
 EOF
 chmod +x "$MOCK_AGENT"
 export LATCH_AGENT_BIN="$MOCK_AGENT"
+export LATCH_PROMPT_WAIT_MS=200
 
 export LATCH_CONFIG_FILE="$LATCHBOARD_CONFIG/config"
 cat << 'EOF' > "$LATCH_CONFIG_FILE"
@@ -65,6 +66,11 @@ for _ in $(seq 1 20); do
 done
 grep -q "args: --model fable --effort low | fullscreen=1" "$LATCHBOARD_STATE_DIR/agent-start.log"
 
+# the prompt is held briefly until the agent is ready
+for _ in $(seq 1 60); do
+    "$LATCH_UP" status | grep -q "scrub \[needs-you\]" && break
+    sleep 0.1
+done
 "$LATCH_UP" status | grep -q "scrub \[needs-you\]"
 "$LATCH_UP" pause scrub | grep -q "paused"
 "$LATCH_UP" status | grep -q "scrub \[paused\]"
@@ -87,3 +93,11 @@ for _ in $(seq 1 20); do
 done
 grep -q "args: --model fable --effort high | fullscreen=0" "$LATCHBOARD_STATE_DIR/agent-start.log"
 "$LATCH_UP" stop scrub | grep -q "stopped scrub"
+
+# stopping the runner also stops its agent
+for _ in $(seq 1 40); do
+    pgrep -f "$MOCK_AGENT" >/dev/null || break
+    sleep 0.1
+done
+! pgrep -f "$MOCK_AGENT" >/dev/null
+

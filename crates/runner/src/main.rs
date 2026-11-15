@@ -8,14 +8,62 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Set by SIGTERM/SIGINT/SIGHUP so the main thread can stop the agent and
+/// clean up before exiting.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_shutdown_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Millisecond timestamp of the agent's most recent output (0: none yet since
+/// it was spawned).
+static LAST_OUTPUT_MS: AtomicI64 = AtomicI64::new(0);
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// How long a freshly started agent gets to switch its terminal to raw mode
+/// (i.e. bring up its TUI) before the prompt is sent line-style anyway.
+/// `LATCH_PROMPT_WAIT_MS` overrides it, for agents that read plain lines.
+const PROMPT_WAIT: Duration = Duration::from_secs(10);
+
+fn line_prompt_wait() -> Duration {
+    env::var("LATCH_PROMPT_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(PROMPT_WAIT)
+}
+/// A TUI gets the prompt once it has stopped drawing for this long...
+const TUI_QUIET_MS: i64 = 1000;
+/// ...or after this long regardless.
+const TUI_WAIT: Duration = Duration::from_secs(15);
+
+/// Decide whether a held-back prompt can go to the agent now. `raw` is whether
+/// the agent runs a TUI, `waited` the time since it was spawned, `quiet_ms`
+/// the time since it last wrote output (None: it has not written any yet).
+fn prompt_ready(raw: bool, waited: Duration, quiet_ms: Option<i64>, line_wait: Duration) -> bool {
+    if raw {
+        quiet_ms.is_some_and(|q| q >= TUI_QUIET_MS) || waited >= TUI_WAIT
+    } else {
+        waited >= line_wait
+    }
+}
 
 #[derive(Debug, Clone)]
 struct TickSpec {
@@ -182,18 +230,134 @@ fn apply_agent_config(cfg: &HashMap<String, String>, agent_args: &mut Vec<String
     cfg.get("agent_fullscreen").map(|v| config_flag(v)).unwrap_or(false)
 }
 
-/// Give the agent's PTY the size of our own terminal (80x24 when detached), so
-/// a fullscreen TUI has a real screen to draw on.
-fn sync_pty_size(master_fd: RawFd) {
+/// Size of the terminal latch-run itself is attached to (80x24 when detached).
+fn outer_winsize() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let got = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
     if !got || ws.ws_row == 0 || ws.ws_col == 0 {
-        ws.ws_row = 24;
-        ws.ws_col = 80;
+        return (24, 80);
     }
+    (ws.ws_row, ws.ws_col)
+}
+
+/// Resize the agent's PTY; the kernel then sends the agent SIGWINCH.
+fn set_pty_size(master_fd: RawFd, size: (u16, u16)) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    ws.ws_row = size.0;
+    ws.ws_col = size.1;
     unsafe {
         libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
     }
+}
+
+/// True once the agent has put its terminal into raw mode, i.e. a TUI is
+/// reading keys rather than lines. Always false for a pipe.
+fn pty_is_raw(fd: RawFd) -> bool {
+    let mut tio: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe { libc::tcgetattr(fd, &mut tio) == 0 && tio.c_lflag & libc::ICANON == 0 }
+}
+
+/// Send one line of input to the agent. A TUI needs Enter (CR) as its own
+/// keypress to submit; a line-reading agent needs a newline.
+fn send_line(w: &mut fs::File, text: &str) {
+    if pty_is_raw(w.as_raw_fd()) {
+        let _ = w.write_all(text.as_bytes());
+        let _ = w.flush();
+        thread::sleep(Duration::from_millis(150));
+        let _ = w.write_all(b"\r");
+    } else {
+        let _ = writeln!(w, "{}", text);
+    }
+}
+
+fn set_cloexec(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// Ask the agent (and its process group) to exit, escalating to SIGKILL if it
+/// has not gone within two seconds.
+fn stop_child(child: &mut Child) {
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+        libc::kill(pid, libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Copy agent output to our stdout and watch it for needs-you markers.
+fn spawn_reader(mut reader: fs::File, state: Arc<Mutex<RunnerState>>) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    LAST_OUTPUT_MS.store(now_ms(), Ordering::Relaxed);
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(&buf[..n]);
+                    let _ = out.flush();
+                    drop(out);
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    if text.contains("NEEDS_YOU")
+                        || text.contains("[needs-you]")
+                        || text.contains("waiting for user")
+                    {
+                        if let Ok(mut st) = state.lock() {
+                            st.needs_you = true;
+                            save_registry(&st);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// When latch-run owns a real terminal (a tmux tab), switch it to raw mode and
+/// pass keystrokes and terminal replies through to the agent, so its TUI is
+/// usable. Returns the settings to restore on exit.
+fn forward_terminal_input(writer: Arc<Mutex<fs::File>>) -> Option<libc::termios> {
+    let fd = libc::STDIN_FILENO;
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::isatty(fd) } != 1 || unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+        return None;
+    }
+    let mut raw = saved;
+    unsafe {
+        libc::cfmakeraw(&mut raw);
+        libc::tcsetattr(fd, libc::TCSANOW, &raw);
+    }
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut stdin = std::io::stdin().lock();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut w) = writer.lock() {
+                        let _ = w.write_all(&buf[..n]);
+                    }
+                }
+            }
+        }
+    });
+    Some(saved)
 }
 
 fn common_md_path() -> PathBuf {
@@ -224,7 +388,9 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
     };
 
     if pty_ok {
-        sync_pty_size(master_fd);
+        set_pty_size(master_fd, outer_winsize());
+        set_cloexec(master_fd);
+        set_cloexec(slave_fd);
         let slave_in = unsafe { Stdio::from_raw_fd( libc::dup(slave_fd) ) };
         let slave_out = unsafe { Stdio::from_raw_fd( libc::dup(slave_fd) ) };
         let slave_err = unsafe { Stdio::from_raw_fd(slave_fd) };
@@ -243,13 +409,17 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
 
         unsafe {
             cmd.pre_exec(|| {
+                // Own session with the PTY as controlling terminal: the agent
+                // then gets SIGWINCH on resize and SIGHUP if latch-run dies.
                 libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
                 Ok(())
             });
         }
 
         let child = cmd.spawn().map_err(|e| e.to_string())?;
-        let writer = unsafe { fs::File::from_raw_fd( libc::dup(master_fd) ) };
+        let writer =
+            unsafe { fs::File::from_raw_fd(libc::fcntl(master_fd, libc::F_DUPFD_CLOEXEC, 0)) };
         let reader = unsafe { fs::File::from_raw_fd(master_fd) };
         Ok((child, FilePair { reader, writer }))
     } else {
@@ -354,6 +524,13 @@ fn main() {
     };
     let _ = listener.set_nonblocking(true);
 
+    unsafe {
+        let handler = on_shutdown_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGHUP, handler);
+    }
+
     let now = now_epoch();
     let initial_state = RunnerState {
         tick_id: spec.tick_id.clone(),
@@ -391,39 +568,40 @@ fn main() {
     };
 
     let writer_arc = Arc::new(Mutex::new(io_pair.writer));
-    if !spec.prompt.is_empty() {
-        if let Ok(mut w) = writer_arc.lock() {
-            let _ = writeln!(w, "{}", spec.prompt);
-        }
-    }
+    spawn_reader(io_pair.reader, Arc::clone(&shared_state));
+    let saved_termios = forward_terminal_input(Arc::clone(&writer_arc));
 
-    let state_for_reader = Arc::clone(&shared_state);
-    let mut reader = io_pair.reader;
-    thread::spawn(move || {
-        let mut buf = [0u8; 1024];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[..n]);
-                    print!("{}", text);
-                    let _ = std::io::stdout().flush();
-                    if text.contains("NEEDS_YOU")
-                        || text.contains("[needs-you]")
-                        || text.contains("waiting for user")
-                    {
-                        if let Ok(mut st) = state_for_reader.lock() {
-                            st.needs_you = true;
-                            save_registry(&st);
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    // The prompt is held back until the agent is ready to take it.
+    let mut prompt_due: Option<Instant> = Some(Instant::now());
+    let mut pty_size = outer_winsize();
+    let line_wait = line_prompt_wait();
 
     loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let size = outer_winsize();
+        if size != pty_size {
+            pty_size = size;
+            if let Ok(w) = writer_arc.lock() {
+                set_pty_size(w.as_raw_fd(), size);
+            }
+        }
+
+        if let Some(since) = prompt_due {
+            if let Ok(mut w) = writer_arc.lock() {
+                let last = LAST_OUTPUT_MS.load(Ordering::Relaxed);
+                let quiet_ms = (last > 0).then(|| now_ms() - last);
+                if prompt_ready(pty_is_raw(w.as_raw_fd()), since.elapsed(), quiet_ms, line_wait) {
+                    prompt_due = None;
+                    if !spec.prompt.is_empty() {
+                        send_line(&mut w, &spec.prompt);
+                    }
+                }
+            }
+        }
+
         if let Ok((mut stream, _)) = listener.accept() {
             let mut req_buf = String::new();
             let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
@@ -508,7 +686,7 @@ fn main() {
         if ticks_to_send > 0 {
             if let Ok(mut w) = writer_arc.lock() {
                 for _ in 0..ticks_to_send {
-                    let _ = writeln!(w, "TICK {}", now_ts);
+                    send_line(&mut w, &format!("TICK {}", now_ts));
                 }
             }
             let mut st = shared_state.lock().unwrap();
@@ -544,8 +722,7 @@ fn main() {
         let restart_reason = pending_restart.lock().unwrap().take();
         if let Some(reason) = restart_reason {
             record_handover_note(&spec.tick_id, &reason);
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(&mut child);
             if let Ok(updated) = parse_tick_file(&spec.path) {
                 spec = updated;
             }
@@ -553,10 +730,10 @@ fn main() {
                 child = new_child;
                 if let Ok(mut w) = writer_arc.lock() {
                     *w = new_io.writer;
-                    if !spec.prompt.is_empty() {
-                        let _ = writeln!(w, "{}", spec.prompt);
-                    }
                 }
+                LAST_OUTPUT_MS.store(0, Ordering::Relaxed);
+                spawn_reader(new_io.reader, Arc::clone(&shared_state));
+                prompt_due = Some(Instant::now());
                 let mut st = shared_state.lock().unwrap();
                 st.title = spec.title.clone();
                 st.every_secs = spec.every_secs;
@@ -568,7 +745,18 @@ fn main() {
         thread::sleep(Duration::from_millis(100));
     }
 
+    stop_child(&mut child);
+    if let Some(saved) = saved_termios {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
+        }
+    }
     let _ = fs::remove_file(&sock_path);
+    let _ = fs::remove_file(
+        state_dir
+            .join("runners")
+            .join(format!("{}.json", spec.tick_id)),
+    );
 }
 
 #[cfg(test)]
@@ -596,6 +784,19 @@ mod tests {
         let full = apply_agent_config(&cfg(&[("agent_model", "fable"), ("agent_effort", "low")]), &mut args);
         assert!(!full);
         assert_eq!(args, ["--effort=high", "--model", "fable"]);
+    }
+
+    #[test]
+    fn prompt_waits_for_the_agent() {
+        // line-based agent: fixed wait
+        let w = PROMPT_WAIT;
+        assert!(!prompt_ready(false, Duration::from_secs(1), Some(60_000), w));
+        assert!(prompt_ready(false, PROMPT_WAIT, None, w));
+        // TUI: once it has drawn and gone quiet, or eventually regardless
+        assert!(!prompt_ready(true, Duration::from_secs(5), None, w));
+        assert!(!prompt_ready(true, Duration::from_secs(5), Some(200), w));
+        assert!(prompt_ready(true, Duration::from_secs(5), Some(TUI_QUIET_MS), w));
+        assert!(prompt_ready(true, TUI_WAIT, None, w));
     }
 
     #[test]

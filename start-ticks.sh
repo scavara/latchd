@@ -5,8 +5,38 @@ SESSION="latchd-ticks"
 PROJECT_DIR="$HOME/projects/latchd"
 STATE_DIR="${LATCHBOARD_STATE_DIR:-$HOME/.local/state/latchboard}"
 
+# PIDs of agents started by a runner (they carry LATCH_SESSION in their
+# environment), including ones orphaned by an earlier runner.
+agent_pids() {
+    local env_file pid
+    for env_file in /proc/[0-9]*/environ; do
+        pid="${env_file#/proc/}"
+        pid="${pid%/environ}"
+        [ "$pid" = "$$" ] && continue
+        if { tr '\0' '\n' < "$env_file"; } 2>/dev/null | grep -q '^LATCH_SESSION='; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
 clean_runners() {
-    pkill -TERM -f "latch-run" 2>/dev/null || true
+    local pids
+    # Runners stop their own agent on TERM; give them a moment to do it.
+    pkill -TERM -x "latch-run" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        pgrep -x "latch-run" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    pkill -KILL -x "latch-run" 2>/dev/null || true
+
+    # Then sweep up any agent that is still around.
+    pids="$(agent_pids)"
+    if [ -n "$pids" ]; then
+        kill -TERM $pids 2>/dev/null || true
+        sleep 0.5
+        pids="$(agent_pids)"
+        [ -n "$pids" ] && kill -KILL $pids 2>/dev/null || true
+    fi
     rm -f "$STATE_DIR"/runners/*.json "$STATE_DIR"/sockets/*.sock 2>/dev/null || true
 }
 
