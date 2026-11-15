@@ -1,0 +1,12 @@
+# latchd config: `key = value`, one per line. Installed to ~/.config/latchd/config.
+# These three control how latch-run starts the agent for every tick; a tick's
+# own `agent_args:` header wins when it sets the same flag.
+
+# Model passed as `--model`. `fable` is the alias for the latest model.
+agent_model = fable
+
+# Effort passed as `--effort` (low, medium, high, xhigh, max). Agent default is medium.
+agent_effort = low
+
+# Start the agent TUI in fullscreen (alt-screen) mode.
+agent_fullscreen = true

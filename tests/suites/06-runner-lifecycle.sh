@@ -21,6 +21,7 @@ mkdir -p "$LATCHD_DIR" "$LATCH_HANDOVER_DIR" "$LATCHBOARD_STATE_DIR" "$LATCHBOAR
 MOCK_AGENT="$SCRATCH/mock-agent.sh"
 cat << 'EOF' > "$MOCK_AGENT"
 #!/usr/bin/env bash
+echo "args: $* | fullscreen=${CLAUDE_CODE_NO_FLICKER:-0}" >> "${LATCHBOARD_STATE_DIR}/agent-start.log"
 while IFS= read -r line; do
     if [[ "$line" == *"TRIGGER_NEEDS_YOU"* ]]; then
         echo "[needs-you] waiting for user approval"
@@ -30,6 +31,14 @@ done
 EOF
 chmod +x "$MOCK_AGENT"
 export LATCH_AGENT_BIN="$MOCK_AGENT"
+
+export LATCH_CONFIG_FILE="$LATCHBOARD_CONFIG/config"
+cat << 'EOF' > "$LATCH_CONFIG_FILE"
+# agent launch settings
+agent_model = fable
+agent_effort = low
+agent_fullscreen = true
+EOF
 
 cat << 'EOF' > "$LATCHBOARD_CONFIG/common.md"
 # initial rules
@@ -50,6 +59,12 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 
+for _ in $(seq 1 20); do
+    [ -s "$LATCHBOARD_STATE_DIR/agent-start.log" ] && break
+    sleep 0.1
+done
+grep -q "args: --model fable --effort low | fullscreen=1" "$LATCHBOARD_STATE_DIR/agent-start.log"
+
 "$LATCH_UP" status | grep -q "scrub \[needs-you\]"
 "$LATCH_UP" pause scrub | grep -q "paused"
 "$LATCH_UP" status | grep -q "scrub \[paused\]"
@@ -63,4 +78,12 @@ echo "# updated rules" >> "$LATCHBOARD_CONFIG/common.md"
 sleep 0.4
 
 ls "$LATCH_HANDOVER_DIR/handover/scrub/"*runner-handover.json >/dev/null
+
+# editing the config restarts the agent with the new settings
+sed -i 's/^agent_effort = low/agent_effort = high/; s/^agent_fullscreen = true/agent_fullscreen = false/' "$LATCH_CONFIG_FILE"
+for _ in $(seq 1 20); do
+    grep -q "args: --model fable --effort high | fullscreen=0" "$LATCHBOARD_STATE_DIR/agent-start.log" && break
+    sleep 0.1
+done
+grep -q "args: --model fable --effort high | fullscreen=0" "$LATCHBOARD_STATE_DIR/agent-start.log"
 "$LATCH_UP" stop scrub | grep -q "stopped scrub"

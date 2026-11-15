@@ -36,7 +36,7 @@ See [OVERVIEW.md](OVERVIEW.md) for how the pieces fit together.
 ```bash
 ./tests/run.sh        # builds the workspace and runs tests/suites/*.sh
 ./install.sh all      # release build -> ~/.local/bin (latchd, latch-run, latch-up)
-./manage.sh install   # copies latch-note and config/common.md into place
+./manage.sh install   # copies latch-note, config/common.md and config/config into place
 ./manage.sh hooks     # merges hooks/claude-hooks.json into ~/.claude/settings.json
 ./deploy.sh           # builds and installs the full suite + latchboard + start-ticks.sh
 ```
@@ -81,7 +81,6 @@ prompt the agent receives on each tick:
 title: Storage Scrub Tick
 every: 15m
 restart_on: crash, upgrade, change
-agent_args: --quiet
 ---
 Check ZFS pool health and SMART counters on storage nodes.
 ```
@@ -102,6 +101,20 @@ start-ticks.sh --stop     # stop all runners and clean up sockets/state
 ```
 
 ## Configuration
+
+`~/.config/latchd/config` (source: [`config/config`](config/config), installed
+by `./manage.sh install`) holds `key = value` settings the runner applies to
+every tick it starts:
+
+| Key | Example | Effect |
+|---|---|---|
+| `agent_model` | `fable` | Passed to the agent as `--model` (`fable` is the latest-model alias) |
+| `agent_effort` | `low` | Passed as `--effort`; the agent's own default is `medium` |
+| `agent_fullscreen` | `true` | Starts the agent TUI in fullscreen (sets `CLAUDE_CODE_NO_FLICKER=1`) |
+
+A tick's `agent_args:` header wins when it sets the same flag. Editing the file
+restarts running ticks that opted into `change`. `LATCH_CONFIG_FILE` points the
+runner at a different file.
 
 | Variable | Default | Purpose |
 |---|---|---|

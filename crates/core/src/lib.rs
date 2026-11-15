@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -53,6 +54,55 @@ pub fn latchd_config_dir() -> PathBuf {
     home_dir().join(".config/latchd")
 }
 
+/// Location of the `key = value` config file. `LATCH_CONFIG_FILE` overrides;
+/// otherwise the first existing `config` under the latchd / latchboard config
+/// dirs wins (defaulting to the latchd one).
+pub fn config_file_path() -> PathBuf {
+    if let Ok(val) = env::var("LATCH_CONFIG_FILE") {
+        return PathBuf::from(val);
+    }
+    let primary = latchd_config_dir().join("config");
+    if primary.exists() {
+        return primary;
+    }
+    let secondary = latchboard_config_dir().join("config");
+    if secondary.exists() {
+        return secondary;
+    }
+    primary
+}
+
+/// Parse `key = value` lines. Blank lines and `#` comments are skipped, keys
+/// are lowercased, and surrounding quotes on values are dropped.
+pub fn parse_config(raw: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+        out.insert(k.trim().to_lowercase(), v.to_string());
+    }
+    out
+}
+
+pub fn load_config() -> HashMap<String, String> {
+    fs::read_to_string(config_file_path())
+        .map(|raw| parse_config(&raw))
+        .unwrap_or_default()
+}
+
+pub fn config_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 pub fn ensure_dir(path: &PathBuf) -> std::io::Result<()> {
     if !path.exists() {
         fs::create_dir_all(path)?;
@@ -74,4 +124,19 @@ pub fn is_pid_alive(pid: u32) -> bool {
         return true;
     }
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_config_lines() {
+        let cfg = parse_config("# c\n\nAgent_Model = fable\nagent_effort=\"low\"\nbogus\nagent_fullscreen = true\n");
+        assert_eq!(cfg.len(), 3);
+        assert_eq!(cfg["agent_model"], "fable");
+        assert_eq!(cfg["agent_effort"], "low");
+        assert!(config_flag(&cfg["agent_fullscreen"]));
+        assert!(!config_flag("off"));
+    }
 }

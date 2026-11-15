@@ -1,6 +1,6 @@
 use latch_core::{
-    append_jsonl, ensure_dir, handover_state_dir, home_dir, latchboard_config_dir,
-    latchboard_state_dir, now_epoch,
+    append_jsonl, config_file_path, config_flag, ensure_dir, handover_state_dir, home_dir,
+    latchboard_config_dir, latchboard_state_dir, load_config, now_epoch,
 };
 use latch_proto::{parse_duration_secs, ControlRequest, ControlResponse, RunnerState};
 use serde_json::json;
@@ -27,6 +27,7 @@ struct TickSpec {
     runner_cmd: String,
     restart_on: Vec<String>,
     agent_args: Vec<String>,
+    fullscreen: bool,
     prompt: String,
 }
 
@@ -143,10 +144,11 @@ fn parse_tick_file(path: &Path) -> Result<TickSpec, String> {
         .or_else(|| headers.get("claude_args"))
         .cloned()
         .unwrap_or_default();
-    let agent_args = args_raw
+    let mut agent_args: Vec<String> = args_raw
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
+    let fullscreen = apply_agent_config(&load_config(), &mut agent_args);
 
     Ok(TickSpec {
         tick_id,
@@ -157,8 +159,41 @@ fn parse_tick_file(path: &Path) -> Result<TickSpec, String> {
         runner_cmd,
         restart_on,
         agent_args,
+        fullscreen,
         prompt: prompt_lines.join("\n").trim().to_string(),
     })
+}
+
+/// Fold the config file's agent settings into the tick's arguments. A flag the
+/// tick already sets in `agent_args` wins over the config value. Returns
+/// whether the agent TUI should start fullscreen.
+fn apply_agent_config(cfg: &HashMap<String, String>, agent_args: &mut Vec<String>) -> bool {
+    for (key, flag) in [("agent_model", "--model"), ("agent_effort", "--effort")] {
+        let Some(value) = cfg.get(key).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let prefix = format!("{}=", flag);
+        if agent_args.iter().any(|a| a == flag || a.starts_with(&prefix)) {
+            continue;
+        }
+        agent_args.push(flag.to_string());
+        agent_args.push(value.clone());
+    }
+    cfg.get("agent_fullscreen").map(|v| config_flag(v)).unwrap_or(false)
+}
+
+/// Give the agent's PTY the size of our own terminal (80x24 when detached), so
+/// a fullscreen TUI has a real screen to draw on.
+fn sync_pty_size(master_fd: RawFd) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let got = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+    if !got || ws.ws_row == 0 || ws.ws_col == 0 {
+        ws.ws_row = 24;
+        ws.ws_col = 80;
+    }
+    unsafe {
+        libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
+    }
 }
 
 fn common_md_path() -> PathBuf {
@@ -189,6 +224,7 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
     };
 
     if pty_ok {
+        sync_pty_size(master_fd);
         let slave_in = unsafe { Stdio::from_raw_fd( libc::dup(slave_fd) ) };
         let slave_out = unsafe { Stdio::from_raw_fd( libc::dup(slave_fd) ) };
         let slave_err = unsafe { Stdio::from_raw_fd(slave_fd) };
@@ -201,6 +237,9 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
             .stdin(slave_in)
             .stdout(slave_out)
             .stderr(slave_err);
+        if spec.fullscreen {
+            cmd.env("CLAUDE_CODE_NO_FLICKER", "1");
+        }
 
         unsafe {
             cmd.pre_exec(|| {
@@ -215,6 +254,9 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
         Ok((child, FilePair { reader, writer }))
     } else {
         let mut cmd = Command::new(&spec.runner_cmd);
+        if spec.fullscreen {
+            cmd.env("CLAUDE_CODE_NO_FLICKER", "1");
+        }
         let mut child = cmd
             .args(&spec.agent_args)
             .env("LATCH_SESSION", &spec.tick_id)
@@ -337,6 +379,7 @@ fn main() {
     let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from(""));
     let mut tick_fp = file_fingerprint(&spec.path);
     let mut common_fp = file_fingerprint(&common_md_path());
+    let mut config_fp = file_fingerprint(&config_file_path());
     let mut bin_fp = file_fingerprint(&exe_path);
 
     let (mut child, io_pair) = match spawn_session_pty(&spec) {
@@ -475,13 +518,15 @@ fn main() {
 
         let new_tick_fp = file_fingerprint(&spec.path);
         let new_common_fp = file_fingerprint(&common_md_path());
+        let new_config_fp = file_fingerprint(&config_file_path());
         let new_bin_fp = file_fingerprint(&exe_path);
 
-        if (new_tick_fp != tick_fp || new_common_fp != common_fp)
+        if (new_tick_fp != tick_fp || new_common_fp != common_fp || new_config_fp != config_fp)
             && spec.restart_on.iter().any(|r| r == "change")
         {
             tick_fp = new_tick_fp;
             common_fp = new_common_fp;
+            config_fp = new_config_fp;
             *pending_restart.lock().unwrap() = Some("change".to_string());
         } else if new_bin_fp != bin_fp && spec.restart_on.iter().any(|r| r == "upgrade") {
             bin_fp = new_bin_fp;
@@ -524,4 +569,39 @@ fn main() {
     }
 
     let _ = fs::remove_file(&sock_path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn config_adds_model_effort_and_fullscreen() {
+        let mut args = Vec::new();
+        let full = apply_agent_config(
+            &cfg(&[("agent_model", "fable"), ("agent_effort", "low"), ("agent_fullscreen", "true")]),
+            &mut args,
+        );
+        assert!(full);
+        assert_eq!(args, ["--model", "fable", "--effort", "low"]);
+    }
+
+    #[test]
+    fn tick_args_win_over_config() {
+        let mut args = vec!["--effort=high".to_string()];
+        let full = apply_agent_config(&cfg(&[("agent_model", "fable"), ("agent_effort", "low")]), &mut args);
+        assert!(!full);
+        assert_eq!(args, ["--effort=high", "--model", "fable"]);
+    }
+
+    #[test]
+    fn empty_config_changes_nothing() {
+        let mut args = vec!["--verbose".to_string()];
+        assert!(!apply_agent_config(&HashMap::new(), &mut args));
+        assert_eq!(args, ["--verbose"]);
+    }
 }
