@@ -1,0 +1,7 @@
+[Unit]
+Description=Sanitize zsh history (multiline, rm, broken, mistyped, duplicate entries)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/zsh-history-sanitize
+Nice=10

@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Sanitize a zsh history file.
+
+Drops, in this order:
+  multiline   entries spanning more than one line
+  rm          entries that run rm (also via sudo, xargs, find -exec, /bin/rm)
+  syntax      entries zsh cannot parse (unclosed quote, trailing pipe, ...)
+  unknown     entries whose command is not a known command, alias, function,
+              builtin or directory (typos)
+  duplicate   all but the most recent occurrence of a command
+
+Surviving entries are written back byte-for-byte, so timestamps and zsh's
+internal encoding of non-ASCII characters are preserved. Standard library only.
+"""
+
+import argparse
+import fcntl
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+META = 0x83  # zsh stores some bytes as META followed by (byte ^ 32)
+EXTENDED = re.compile(rb"^: \d+:\d+;")
+MARKER = "__zsh_history_sanitize_names__"
+
+# Words that take a command as their argument.
+PREFIX = r"(?:sudo|doas|command|exec|builtin|noglob|nocorrect|nohup|time|xargs)"
+RM = re.compile(
+    r"(?:^|[;&|({`]|\$\(|\s-(?:exec|execdir|ok|okdir)\s)\s*"  # command position
+    r"(?:\w+=\S*\s+)*"                                        # VAR=value
+    rf"(?:{PREFIX}\s+(?:-\S+\s+)*)*"                          # sudo, xargs -0, ...
+    r"\\?(?:\S*/)?rm(?=$|[\s;&|)])"                           # rm, \rm, /bin/rm
+)
+ASSIGNMENT = re.compile(r"^\w+(\[[^\]]*\])?\+?=")
+PLAIN_WORD = re.compile(r"^[\w.+-]+$")
+PREFIX_WORD = re.compile(rf"^{PREFIX}$|^env$|^nice$|^-$")
+
+
+def unmetafy(raw: bytes) -> str:
+    out = bytearray()
+    it = iter(raw)
+    for b in it:
+        out.append(next(it, 0) ^ 32 if b == META else b)
+    return out.decode("utf-8", "surrogateescape")
+
+
+def parse(data: bytes):
+    """Yield (raw_bytes, command_text, physical_line_count) per history entry."""
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    i = 0
+    while i < len(lines):
+        start = i
+        # A newline inside a command is stored as backslash-newline.
+        while lines[i].endswith(b"\\") and i + 1 < len(lines):
+            i += 1
+        i += 1
+        chunk = lines[start:i]
+        raw = b"\n".join(chunk) + b"\n"
+        cmd = EXTENDED.sub(b"", b"\n".join(chunk), count=1)
+        yield raw, unmetafy(cmd).strip(), len(chunk)
+
+
+def known_names(zsh: str):
+    """Names an interactive zsh would accept as a command, or None if unknown."""
+    script = (
+        f"print -r -- {MARKER}; "
+        "print -rl -- ${(k)commands} ${(k)aliases} ${(k)galiases} "
+        "${(k)functions} ${(k)builtins} ${(k)reswords}"
+    )
+    try:
+        out = subprocess.run(
+            [zsh, "-ic", script], stdin=subprocess.DEVNULL, capture_output=True,
+            timeout=30, start_new_session=True,
+        ).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if MARKER not in out:
+        return None
+    names = set(out.split(MARKER, 1)[1].split("\n"))
+    names.discard("")
+    return names if len(names) > 50 else None
+
+
+def command_word(cmd: str):
+    """First command word if it can be judged, else None (= keep the entry)."""
+    words = cmd.split()
+    while words:
+        w = words[0]
+        if ASSIGNMENT.match(w):
+            words.pop(0)
+        elif PREFIX_WORD.match(w):
+            words.pop(0)
+            if words and words[0].startswith("-"):
+                return None  # option arguments are too ambiguous to skip
+        else:
+            return w if PLAIN_WORD.match(w) else None
+    return None
+
+
+def syntax_ok(zsh: str, cmd: str) -> bool:
+    try:
+        r = subprocess.run(
+            [zsh, "-f", "-n", "-c", cmd], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return True  # cannot tell, keep it
+    return r.returncode == 0
+
+
+def sanitize(data: bytes, zsh, names, home: Path):
+    """Return (kept_raw_entries, [(reason, command), ...])."""
+    entries = list(parse(data))
+    reasons = {}
+
+    for idx, (_, cmd, nlines) in enumerate(entries):
+        if nlines > 1 or "\n" in cmd:
+            reasons[idx] = "multiline"
+        elif not cmd:
+            reasons[idx] = "empty"
+        elif RM.search(cmd):
+            reasons[idx] = "rm"
+
+    if zsh:
+        todo = sorted({e[1] for i, e in enumerate(entries) if i not in reasons})
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+            ok = dict(zip(todo, pool.map(lambda c: syntax_ok(zsh, c), todo)))
+        for idx, (_, cmd, _) in enumerate(entries):
+            if idx not in reasons and not ok[cmd]:
+                reasons[idx] = "syntax"
+
+    if names:
+        for idx, (_, cmd, _) in enumerate(entries):
+            if idx in reasons:
+                continue
+            word = command_word(cmd)
+            if word and word not in names and not (home / word).is_dir():
+                reasons[idx] = "unknown"
+
+    seen = set()
+    for idx in range(len(entries) - 1, -1, -1):  # newest occurrence wins
+        if idx in reasons:
+            continue
+        cmd = entries[idx][1]
+        if cmd in seen:
+            reasons[idx] = "duplicate"
+        seen.add(cmd)
+
+    kept = [e[0] for i, e in enumerate(entries) if i not in reasons]
+    dropped = [(reasons[i], entries[i][1]) for i in sorted(reasons)]
+    return kept, dropped
+
+
+class HistLock:
+    """Take both locks zsh may use: HISTFILE.LOCK and an fcntl lock."""
+
+    def __init__(self, path: Path, wait=10.0):
+        self.path, self.lock, self.wait = path, Path(str(path) + ".LOCK"), wait
+        self.fd = None
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                os.close(os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+                break
+            except FileExistsError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{self.lock} is held by another process")
+                time.sleep(0.2)
+        try:
+            self.fd = os.open(self.path, os.O_RDWR)
+            fcntl.lockf(self.fd, fcntl.LOCK_EX)
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)
+        self.lock.unlink(missing_ok=True)
+
+
+def backup(hist: Path, backup_dir: Path, keep: int):
+    if keep <= 0:
+        return
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    dest = backup_dir / f"{hist.name}.{time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(hist, dest)
+    os.chmod(dest, 0o600)
+    old = sorted(backup_dir.glob(f"{hist.name}.*"))[:-keep]
+    for p in old:
+        p.unlink()
+
+
+def main():
+    home = Path.home()
+    default_hist = os.environ.get("HISTFILE") or str(
+        Path(os.environ.get("ZDOTDIR") or home) / ".zsh_history")
+    state = Path(os.environ.get("XDG_STATE_HOME") or home / ".local/state")
+
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("histfile", nargs="?", default=default_hist,
+                    help="history file (default: $HISTFILE or ~/.zsh_history)")
+    ap.add_argument("-n", "--dry-run", action="store_true",
+                    help="list what would be removed, change nothing")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="list every removed entry")
+    ap.add_argument("--keep-backups", type=int, default=7, metavar="N",
+                    help="backups to keep, 0 disables them (default: 7)")
+    ap.add_argument("--backup-dir", type=Path,
+                    default=state / "zsh-history-sanitize")
+    ap.add_argument("--no-unknown-check", action="store_true",
+                    help="do not drop entries whose command is not found")
+    args = ap.parse_args()
+
+    hist = Path(args.histfile).expanduser()
+    if not hist.is_file():
+        print(f"{hist}: no such file, nothing to do")
+        return 0
+    hist = hist.resolve()
+
+    zsh = shutil.which("zsh")
+    names = None
+    if not zsh:
+        print("warning: zsh not found, skipping syntax and unknown-command checks",
+              file=sys.stderr)
+    elif not args.no_unknown_check:
+        names = known_names(zsh)
+        if names is None:
+            print("warning: could not list commands from an interactive zsh, "
+                  "skipping unknown-command check", file=sys.stderr)
+
+    def run():
+        data = hist.read_bytes()
+        kept, dropped = sanitize(data, zsh, names, home)
+        counts = {}
+        for reason, cmd in dropped:
+            counts[reason] = counts.get(reason, 0) + 1
+            if args.verbose or args.dry_run:
+                print(f"{reason:9} {cmd.splitlines()[0] if cmd else ''}")
+        summary = ", ".join(f"{n} {r}" for r, n in sorted(counts.items())) or "nothing"
+        verb = "would remove" if args.dry_run else "removed"
+        print(f"{hist}: {verb} {len(dropped)} of {len(kept) + len(dropped)} "
+              f"entries ({summary})")
+        if args.dry_run or not dropped:
+            return
+        backup(hist, args.backup_dir, args.keep_backups)
+        st = hist.stat()
+        fd, tmp = tempfile.mkstemp(dir=hist.parent, prefix=hist.name + ".")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"".join(kept))
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, st.st_mode & 0o7777)
+            os.replace(tmp, hist)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+    if args.dry_run:
+        run()
+        return 0
+    try:
+        with HistLock(hist):
+            run()
+    except TimeoutError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
