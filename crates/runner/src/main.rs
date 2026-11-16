@@ -460,6 +460,7 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
             .env("LATCH_TITLE", &spec.title)
             .env("LATCH_TICK_FILE", &tick_file)
             .env("LATCH_PRIO", prio)
+            .env("LATCH_ROLE", spec.role.as_deref().unwrap_or("standard"))
             .stdin(slave_in)
             .stdout(slave_out)
             .stderr(slave_err);
@@ -493,6 +494,7 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
             .env("LATCH_TITLE", &spec.title)
             .env("LATCH_TICK_FILE", &tick_file)
             .env("LATCH_PRIO", prio)
+            .env("LATCH_ROLE", spec.role.as_deref().unwrap_or("standard"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

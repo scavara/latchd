@@ -59,18 +59,29 @@ project: see [INSTALL.md](INSTALL.md).
 latchd claim ab1001 --holder tick-a -p 5
 latchd status
 
-# A higher-priority session queues behind it; the sweeper logs a yield request
-latchd wait ab1001 --waiter tick-b -p 8
-latchd sweep
+# Another session queues for it (first come, first served) and asks the holder
+latchd wait ab1001 --waiter tick-b --reason "disk check"
+
+# The holder answers: hand over now, promise it, or decline
+latchd reply ab1001 yes --holder tick-a
 
 # Operator directive: block every node matching ab10* for the next hour
 latch-note directive "ZFS resilver in progress" 'ab10*' --until +1h --block
 ```
 
 Claims are idle-swept: warned after 45 minutes without use, released 10
-minutes after the warning. A queued waiter gains +1 effective priority per
-30 minutes (capped at +2), and a yield is requested when a waiter outranks the
-holder by 2 or more.
+minutes after the warning.
+
+Waiters are served first come, first served. The first in line asks the holder
+to hand the node over; the holder answers with `latchd reply <node> yes`
+(hand over now), `yes --eta 20m` (promise) or `no --eta 1h`. If the holder says
+nothing for 15 minutes, the operator is asked instead. A freed node is offered
+to the first in line, who has 10 minutes to claim it.
+
+Incident ticks (`role: incident`) are the exception: `latchd take` takes a node
+from a standard tick without asking and without queueing, and a node an
+incident tick holds is off-limits to every other session, other incident ticks
+included, until it is released.
 
 ## Ticks
 

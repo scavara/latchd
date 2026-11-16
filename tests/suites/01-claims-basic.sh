@@ -24,8 +24,7 @@ fi
 
 "$LATCHD" wait ab1001 --waiter tick-b -p 5 | grep -q "queued tick-b"
 
-sqlite3 "$LATCHD_DIR/claims.db" "UPDATE queue SET enqueued_at = enqueued_at - 3700 WHERE node = 'ab1001';"
-"$LATCHD" sweep | grep -q "yield requested on ab1001: tick-b (p7) vs tick-a (p5)"
+"$LATCHD" status | grep -q "ab1001 waiting by tick-b (1 in line, 0m, asked tick-a 0m ago)"
 
 "$LATCHD" grant-take ab1001 --session incident
 "$LATCHD" take ab1001 --session incident | grep -q "incident take: ab1001 claimed by incident at p9"

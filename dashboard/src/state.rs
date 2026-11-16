@@ -8,6 +8,9 @@ pub struct ClaimEntry {
     pub node: String,
     pub holder: String,
     pub prio: u8,
+    /// Held by an incident tick (off-limits to everyone else).
+    #[serde(default)]
+    pub incident: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,9 +84,32 @@ pub struct Snapshot {
     pub runners: Vec<serde_json::Value>,
     pub notices: Vec<serde_json::Value>,
     pub directives: Vec<DirectiveEntry>,
+    /// (node, waiter) pairs, first come first within each node.
+    pub waiters: Vec<(String, String)>,
 }
 
 impl Snapshot {
+    /// Who is waiting for a node, in line order.
+    pub fn waiters_for(&self, node: &str) -> Vec<&str> {
+        self.waiters
+            .iter()
+            .filter(|(n, _)| n == node)
+            .map(|(_, w)| w.as_str())
+            .collect()
+    }
+
+    /// Nodes somebody waits for although nobody holds them.
+    pub fn free_nodes_with_waiters(&self) -> Vec<&str> {
+        let mut nodes: Vec<&str> = self
+            .waiters
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| !self.claims.iter().any(|c| c.node == *n))
+            .collect();
+        nodes.dedup();
+        nodes
+    }
+
     /// Tick ids in the order the Runners panel numbers them.
     pub fn runner_ids(&self) -> Vec<String> {
         self.runners
@@ -106,15 +132,27 @@ pub fn load_snapshot() -> Snapshot {
 
     let db_path = latchd_state_dir().join("claims.db");
     if let Ok(conn) = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        if let Ok(mut stmt) = conn.prepare("SELECT node, holder, prio FROM claims ORDER BY node") {
+        // A database written by an older latchd has no `incident` column.
+        let stmt = conn
+            .prepare("SELECT node, holder, prio, incident FROM claims ORDER BY node")
+            .or_else(|_| conn.prepare("SELECT node, holder, prio, 0 FROM claims ORDER BY node"));
+        if let Ok(mut stmt) = stmt {
             if let Ok(rows) = stmt.query_map([], |r| {
                 Ok(ClaimEntry {
                     node: r.get(0)?,
                     holder: r.get(1)?,
                     prio: r.get(2)?,
+                    incident: r.get::<_, i64>(3)? != 0,
                 })
             }) {
                 snap.claims = rows.filter_map(Result::ok).collect();
+            }
+        }
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT node, waiter FROM queue ORDER BY node, enqueued_at, rowid")
+        {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))) {
+                snap.waiters = rows.filter_map(Result::ok).collect();
             }
         }
     }

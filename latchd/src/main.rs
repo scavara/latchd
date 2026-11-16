@@ -3,7 +3,6 @@ mod db;
 mod directives;
 
 use latch_core::{latchboard_config_dir, latchd_config_dir, now_epoch};
-use rusqlite::params;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::env;
@@ -37,11 +36,15 @@ fn usage() -> ! {
     eprintln!(
         "Usage: latchd <command> [args]
 Commands:
-  claim <node> --holder <id> [-p <1-9>]
+  claim <node> --holder <id> [-p <1-9>] [--incident]
   release <node> [--holder <id>]
-  wait <node> --waiter <id> [-p <1-9>]
+  wait <node> --waiter <id> [-p <1-9>] [--reason <text>]
+      join the queue (first come, first served) and ask the holder for the node
+  reply <node> yes|no [--eta <30m>] [--holder <id>]
+      answer the first waiter: `yes` hands over now, `yes --eta` promises it
   grant-take <node> --session <id>
   take <node> --session <id>
+      incident ticks only: take a node without asking
   sweep
   nodes [glob]
   status [--json]
@@ -72,9 +75,14 @@ fn main() {
             let node = &args[1];
             let mut holder = env::var("LATCH_SESSION").unwrap_or_else(|_| "default".to_string());
             let mut prio: u8 = 5;
+            let mut incident = env::var("LATCH_ROLE").as_deref() == Ok("incident");
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--incident" => {
+                        incident = true;
+                        i += 1;
+                    }
                     "--holder" | "-h" if i + 1 < args.len() => {
                         holder = args[i + 1].clone();
                         i += 2;
@@ -94,7 +102,7 @@ fn main() {
                     }
                     let known = load_known_nodes();
                     let is_known = known.is_empty() || known.contains(node);
-                    match db::claim_node(&conn, node, &holder, eff_prio, is_known) {
+                    match db::claim_node(&conn, node, &holder, eff_prio, is_known, incident) {
                         Ok(msg) => println!("{}", msg),
                         Err(e) => {
                             eprintln!("{}", e);
@@ -137,22 +145,67 @@ fn main() {
             }
             let node = &args[1];
             let mut waiter = env::var("LATCH_SESSION").unwrap_or_else(|_| "default".to_string());
-            let mut prio: u8 = 5;
+            let mut prio: Option<u8> = None;
+            let mut reason: Option<String> = None;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--reason" if i + 1 < args.len() => {
+                        reason = Some(args[i + 1].clone());
+                        i += 2;
+                    }
                     "--waiter" | "--holder" | "-w" if i + 1 < args.len() => {
                         waiter = args[i + 1].clone();
                         i += 2;
                     }
                     "-p" | "--prio" if i + 1 < args.len() => {
-                        prio = args[i + 1].parse().unwrap_or(5).clamp(1, 9);
+                        prio = Some(args[i + 1].parse().unwrap_or(5).clamp(1, 9));
                         i += 2;
                     }
                     _ => i += 1,
                 }
             }
-            match db::enqueue_wait(&conn, node, &waiter, prio) {
+            match db::enqueue_wait(&conn, node, &waiter, prio, reason.as_deref()) {
+                Ok(msg) => println!("{}", msg),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        "reply" => {
+            if args.len() < 3 {
+                usage();
+            }
+            let node = &args[1];
+            let yes = match args[2].as_str() {
+                "yes" | "y" => true,
+                "no" | "n" => false,
+                _ => usage(),
+            };
+            let mut holder = env::var("LATCH_SESSION").unwrap_or_else(|_| "default".to_string());
+            let mut eta_secs: Option<i64> = None;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--holder" | "-h" if i + 1 < args.len() => {
+                        holder = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--eta" if i + 1 < args.len() => {
+                        match latch_proto::parse_duration_secs(&args[i + 1]) {
+                            Some(secs) => eta_secs = Some(secs as i64),
+                            None => {
+                                eprintln!("invalid --eta: {} (use e.g. 20m, 2h)", args[i + 1]);
+                                process::exit(2);
+                            }
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            match db::reply_takeover(&conn, node, &holder, yes, eta_secs) {
                 Ok(msg) => println!("{}", msg),
                 Err(e) => {
                     eprintln!("{}", e);
@@ -226,50 +279,26 @@ fn main() {
         "status" => {
             let as_json = args.iter().any(|a| a == "--json");
             let now = now_epoch();
-            let mut stmt = conn
-                .prepare("SELECT node, holder, prio, claimed_at, last_used_at, warned_at, known_node FROM claims ORDER BY node")
-                .unwrap();
-            let claims: Vec<db::ClaimRow> = stmt
-                .query_map(params![], |r| {
-                    Ok(db::ClaimRow {
-                        node: r.get(0)?,
-                        holder: r.get(1)?,
-                        prio: r.get(2)?,
-                        claimed_at: r.get(3)?,
-                        last_used_at: r.get(4)?,
-                        warned_at: r.get(5)?,
-                        known_node: r.get::<_, i64>(6)? != 0,
-                    })
-                })
-                .unwrap()
-                .filter_map(Result::ok)
-                .collect();
+            let claims = db::load_claims(&conn).unwrap_or_default();
+            let queue_rows = db::load_queue(&conn).unwrap_or_default();
 
-            let mut qstmt = conn
-                .prepare("SELECT node, waiter, base_prio, enqueued_at FROM queue ORDER BY node, enqueued_at")
-                .unwrap();
-            let queue: Vec<serde_json::Value> = qstmt
-                .query_map(params![], |r| {
-                    let row = db::QueueRow {
-                        node: r.get(0)?,
-                        waiter: r.get(1)?,
-                        base_prio: r.get(2)?,
-                        enqueued_at: r.get(3)?,
-                    };
-                    let eff = row.effective_prio(now);
-                    Ok(json!({
-                        "node": row.node,
-                        "waiter": row.waiter,
-                        "base_prio": row.base_prio,
-                        "effective_prio": eff,
-                        "enqueued_at": row.enqueued_at,
-                    }))
-                })
-                .unwrap()
-                .filter_map(Result::ok)
-                .collect();
+            // Position in line restarts at 1 for each node.
+            let mut positions: Vec<usize> = Vec::with_capacity(queue_rows.len());
+            for (i, q) in queue_rows.iter().enumerate() {
+                let same_node = i > 0 && queue_rows[i - 1].node == q.node;
+                positions.push(if same_node { positions[i - 1] + 1 } else { 1 });
+            }
 
             if as_json {
+                let queue: Vec<serde_json::Value> = queue_rows
+                    .iter()
+                    .zip(&positions)
+                    .map(|(q, pos)| {
+                        let mut v = serde_json::to_value(q).unwrap_or_else(|_| json!({}));
+                        v["position"] = json!(pos);
+                        v
+                    })
+                    .collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
@@ -281,15 +310,34 @@ fn main() {
             } else {
                 println!("CLAIMS ({}):", claims.len());
                 for c in &claims {
-                    println!("  {} held by {} (p{})", c.node, c.holder, c.prio);
+                    let tag = if c.incident { " [incident: off-limits]" } else { "" };
+                    println!("  {} held by {} (p{}){}", c.node, c.holder, c.prio, tag);
                 }
-                println!("QUEUE ({}):", queue.len());
-                for q in &queue {
+                println!("QUEUE ({}):", queue_rows.len());
+                for (q, pos) in queue_rows.iter().zip(&positions) {
+                    let state = match (q.reply.as_deref(), q.asked_holder.as_deref(), q.eta_ts) {
+                        (Some("yes"), Some(h), Some(eta)) => {
+                            format!(", {} promised it in {}", h, db::fmt_span(eta - now))
+                        }
+                        (Some("no"), Some(h), _) => format!(", {} declined", h),
+                        (None, Some(h), _) if q.escalated_at.is_some() => {
+                            format!(", {} silent: operator asked", h)
+                        }
+                        (None, Some(h), _) => format!(
+                            ", asked {} {} ago",
+                            h,
+                            db::fmt_span(now - q.asked_at.unwrap_or(now))
+                        ),
+                        _ if q.offered_at.is_some() => ", node is free: offered".to_string(),
+                        _ => String::new(),
+                    };
                     println!(
-                        "  {} waiting by {} (p{})",
-                        q["node"].as_str().unwrap_or(""),
-                        q["waiter"].as_str().unwrap_or(""),
-                        q["effective_prio"].as_u64().unwrap_or(0)
+                        "  {} waiting by {} ({} in line, {}{})",
+                        q.node,
+                        q.waiter,
+                        pos,
+                        db::fmt_span(now - q.enqueued_at),
+                        state
                     );
                 }
             }

@@ -32,18 +32,35 @@ node), `queue` (waiters, keyed by node and waiter) and `take_grants`.
 - **Known nodes:** names listed in the `nodes` file under `LATCHD_CONFIG` or
   `LATCHBOARD_CONFIG`. A claim on an unknown node is allowed but marked, and the
   sweeper releases it after 10 idle minutes.
-- **Queue and priority:** `latchd wait` enqueues a waiter. Effective priority
-  is the base priority plus 1 per 30 minutes waited, capped at +2 (maximum 9).
+- **Queue (first come, first served):** `latchd wait <node> [--reason TEXT]`
+  joins the node's queue; order is arrival order and priority plays no part.
+  A free node with a queue can only be claimed by the first in line.
+- **Takeover negotiation:** a standard tick never takes a held node. The first
+  in line asks the holder (a note in the holder's inbox), and the holder
+  answers with `latchd reply <node> yes` (the claim moves to the waiter at
+  once), `yes --eta 20m` (a promise; the holder keeps the node until it
+  releases it) or `no [--eta 1h]` (the waiter is asked again after the ETA, or
+  after 15 minutes without one). Answers reach the waiter's inbox.
 - **Sweep (`latchd sweep`, or `latchd daemon` every 15 s):** an idle claim is
   warned after 45 minutes and released 10 minutes after the warning. A claim
   is skipped while its holder has a non-expired heartbeat that lists the node
   (`latch-note heartbeat` writes `$LATCH_HANDOVER_DIR/peers/<tick>.json`, valid
-  for twice the tick interval). When a waiter's effective
-  priority is at least the holder's plus 2, a `yield_request` event is logged.
+  for twice the tick interval). The sweep also runs the queues: it offers a
+  freed node to the first in line and drops a waiter that does not claim it
+  within 10 minutes, sends pending takeover questions, and when a holder has
+  not answered for 15 minutes (or is 15 minutes past a promised ETA) asks the
+  operator once through `latch-note ask`.
   The sweep also removes `prio_floor` and synced directives whose end time has
   passed (logged as `directive_expired`).
-- **Incident take:** `latchd grant-take` records that a session may take over a
-  node; `latchd take` then claims it at priority 9.
+- **Incident ticks:** `latchd grant-take` records that the operator named a
+  node to a session; within 60 minutes `latchd take` then claims it at priority
+  9 as an incident claim, taking it from a standard holder without asking
+  (the old holder is told through its inbox) and bypassing the queue. Claims an
+  incident tick makes with `latchd claim` are incident claims too (`--incident`,
+  or `LATCH_ROLE=incident` as the runner sets it). An incident claim is
+  off-limits: no other session can claim or take the node, other incident ticks
+  included, and its holder is never asked to yield. Any number of incident
+  ticks can run side by side, each on its own nodes.
 
 Every state change is appended to `events.jsonl`.
 
@@ -94,8 +111,8 @@ agent and the rest of the system:
 A *tick* is a Markdown file: `key: value` headers, a line containing `---`, then
 the prompt. `latch-run <tick>` parses it, starts the agent command
 (`LATCH_AGENT_BIN`, a `runner:` header, or `claude`) inside a PTY with
-`LATCH_SESSION`, `LATCH_TITLE` and `LATCH_PRIO` set (priority 9 for
-`role: incident`, otherwise 5), and writes `TICK <ts>` lines to it every
+`LATCH_SESSION`, `LATCH_TITLE`, `LATCH_ROLE` and `LATCH_PRIO` set (priority 9
+for `role: incident`, otherwise 5), and writes `TICK <ts>` lines to it every
 `every:` interval.
 
 It also serves a Unix-socket control interface (`tick`, `pause`, `resume`,
@@ -155,4 +172,5 @@ claims, directives and maintenance windows, heartbeat sweeps, rollouts, hook
 refusal and notices, the runner lifecycle, the launcher and manifest tooling,
 the dashboard snapshot and its interactive commands (driven in tmux; skipped
 when tmux is missing), the stale runner sweep, per-tick configuration, the
-session audit log, the pre-action digest, and directive sync.
+session audit log, the pre-action digest, directive sync, and the
+first-come-first-served queue with takeover replies and incident ticks.

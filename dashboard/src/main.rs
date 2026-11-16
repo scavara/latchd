@@ -46,6 +46,10 @@ fn claim_line(c: &state::ClaimEntry, joiner: &str, node_width: usize) -> Line<'s
         Span::styled(format!("{:<width$}", c.node, width = node_width), style),
         Span::raw(format!(" {} {} ", joiner, c.holder)),
         Span::styled(format!("(p{})", c.prio), style),
+        Span::styled(
+            if c.incident { " INCIDENT" } else { "" },
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 
@@ -112,10 +116,33 @@ fn panel_lines(panel: Panel, snap: &Snapshot, now: i64) -> Vec<Line<'static>> {
             lines
         }
         Panel::HostQueues => {
-            if snap.claims.is_empty() {
-                return vec![Line::from("  All host queues idle")];
+            // Each held node with its line of waiters (first come, first
+            // served), then free nodes somebody is still queued for.
+            let in_line = |node: &str| -> Option<Line<'static>> {
+                let waiters = snap.waiters_for(node);
+                if waiters.is_empty() {
+                    return None;
+                }
+                let line: Vec<String> = waiters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| format!("{}. {}", i + 1, w))
+                    .collect();
+                Some(Line::from(format!("      in line: {}", line.join("  "))))
+            };
+            let mut lines = Vec::new();
+            for c in &snap.claims {
+                lines.push(claim_line(c, "locked by", 20));
+                lines.extend(in_line(&c.node));
             }
-            snap.claims.iter().map(|c| claim_line(c, "locked by", 20)).collect()
+            for node in snap.free_nodes_with_waiters() {
+                lines.push(Line::from(format!("  {:<20} free", node)));
+                lines.extend(in_line(node));
+            }
+            if lines.is_empty() {
+                lines.push(Line::from("  All host queues idle"));
+            }
+            lines
         }
         Panel::Rollouts => plain(
             snap.rollouts
@@ -422,11 +449,45 @@ mod tests {
 
     #[test]
     fn claim_line_text_and_colour() {
-        let c = state::ClaimEntry { node: "ab1001".into(), holder: "tick-a".into(), prio: 7 };
+        let mut c = state::ClaimEntry {
+            node: "ab1001".into(),
+            holder: "tick-a".into(),
+            prio: 7,
+            incident: false,
+        };
+        let text = |line: &Line| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
         let line = claim_line(&c, "->", 0);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "  ab1001 -> tick-a (p7)");
+        assert_eq!(text(&line), "  ab1001 -> tick-a (p7)");
         assert_eq!(line.spans[3].style.fg, Some(Color::Yellow));
+        c.incident = true;
+        assert_eq!(text(&claim_line(&c, "->", 0)), "  ab1001 -> tick-a (p7) INCIDENT");
+    }
+
+    #[test]
+    fn host_queues_show_the_line() {
+        let snap = Snapshot {
+            claims: vec![state::ClaimEntry {
+                node: "n1".into(),
+                holder: "tick-a".into(),
+                prio: 5,
+                incident: false,
+            }],
+            waiters: vec![
+                ("n1".into(), "tick-b".into()),
+                ("n1".into(), "tick-c".into()),
+                ("n2".into(), "tick-d".into()),
+            ],
+            ..Snapshot::default()
+        };
+        let text: Vec<String> = panel_lines(Panel::HostQueues, &snap, 0)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text[0].starts_with("  n1 "), "{:?}", text);
+        assert_eq!(text[1], "      in line: 1. tick-b  2. tick-c");
+        assert!(text[2].starts_with("  n2 ") && text[2].ends_with("free"), "{:?}", text);
+        assert_eq!(text[3], "      in line: 1. tick-d");
+        assert_eq!(text.len(), 4);
     }
 
     #[test]
