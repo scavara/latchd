@@ -72,27 +72,75 @@ pub fn config_file_path() -> PathBuf {
     primary
 }
 
-/// Parse `key = value` lines. Blank lines and `#` comments are skipped, keys
-/// are lowercased, and surrounding quotes on values are dropped.
-pub fn parse_config(raw: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
-        out.insert(k.trim().to_lowercase(), v.to_string());
-    }
-    out
+/// Parsed config file: settings that apply to every tick, plus the overrides
+/// from each `[tick-name]` section.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Config {
+    pub global: HashMap<String, String>,
+    pub ticks: HashMap<String, HashMap<String, String>>,
 }
 
-pub fn load_config() -> HashMap<String, String> {
+/// Settings a `[tick]` section may name without the `agent_` prefix.
+const TICK_KEYS: [&str; 4] = ["model", "effort", "mcp_config", "fullscreen"];
+
+impl Config {
+    /// Parse `key = value` lines. Blank lines and `#` comments are skipped,
+    /// keys are lowercased, and surrounding quotes on values are dropped.
+    /// Lines after a `[name]` header belong to that tick; there `model`,
+    /// `effort`, `mcp_config` and `fullscreen` are short for `agent_model` etc.
+    pub fn parse(raw: &str) -> Config {
+        let mut cfg = Config::default();
+        let mut section: Option<String> = None;
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                let name = name.trim().to_string();
+                cfg.ticks.entry(name.clone()).or_default();
+                section = Some(name);
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let mut key = k.trim().to_lowercase();
+            let value = v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+            match &section {
+                Some(name) => {
+                    if TICK_KEYS.contains(&key.as_str()) {
+                        key = format!("agent_{}", key);
+                    }
+                    cfg.ticks.entry(name.clone()).or_default().insert(key, value);
+                }
+                None => {
+                    cfg.global.insert(key, value);
+                }
+            }
+        }
+        cfg
+    }
+
+    /// The settings in force for one tick: the global ones overlaid with the
+    /// first section matching any of `names` (e.g. tick id, then file stem).
+    pub fn for_tick(&self, names: &[&str]) -> HashMap<String, String> {
+        let mut out = self.global.clone();
+        if let Some(section) = names.iter().find_map(|n| self.ticks.get(*n)) {
+            out.extend(section.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        out
+    }
+}
+
+/// Global settings only; see [`Config::parse`] for the format.
+pub fn parse_config(raw: &str) -> HashMap<String, String> {
+    Config::parse(raw).global
+}
+
+pub fn load_config() -> Config {
     fs::read_to_string(config_file_path())
-        .map(|raw| parse_config(&raw))
+        .map(|raw| Config::parse(&raw))
         .unwrap_or_default()
 }
 
@@ -138,5 +186,27 @@ mod tests {
         assert_eq!(cfg["agent_effort"], "low");
         assert!(config_flag(&cfg["agent_fullscreen"]));
         assert!(!config_flag("off"));
+    }
+
+    #[test]
+    fn tick_sections_override_globals() {
+        let cfg = Config::parse(
+            "agent_model = fable\nagent_effort = low\n\n[incident]\nmodel = opus\nMCP_Config = a.json\n\n[10-storage-scrub]\nagent_effort = high\nother = x\n",
+        );
+        assert_eq!(cfg.global.len(), 2);
+
+        let incident = cfg.for_tick(&["incident", "99-incident"]);
+        assert_eq!(incident["agent_model"], "opus");
+        assert_eq!(incident["agent_effort"], "low");
+        assert_eq!(incident["agent_mcp_config"], "a.json");
+
+        // matched by file stem when the tick id has no section
+        let scrub = cfg.for_tick(&["storage-scrub", "10-storage-scrub"]);
+        assert_eq!(scrub["agent_model"], "fable");
+        assert_eq!(scrub["agent_effort"], "high");
+        assert_eq!(scrub["other"], "x");
+
+        // a tick without a section gets the globals unchanged
+        assert_eq!(cfg.for_tick(&["telemetry"]), cfg.global);
     }
 }

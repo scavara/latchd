@@ -196,7 +196,13 @@ fn parse_tick_file(path: &Path) -> Result<TickSpec, String> {
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
-    let fullscreen = apply_agent_config(&load_config(), &mut agent_args);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let cfg = load_config().for_tick(&[&tick_id, stem]);
+    let config_dir = config_file_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let fullscreen = apply_agent_config(&cfg, &config_dir, &mut agent_args);
 
     Ok(TickSpec {
         tick_id,
@@ -212,22 +218,72 @@ fn parse_tick_file(path: &Path) -> Result<TickSpec, String> {
     })
 }
 
-/// Fold the config file's agent settings into the tick's arguments. A flag the
-/// tick already sets in `agent_args` wins over the config value. Returns
-/// whether the agent TUI should start fullscreen.
-fn apply_agent_config(cfg: &HashMap<String, String>, agent_args: &mut Vec<String>) -> bool {
+/// Fold the tick's config settings into its arguments. A flag the tick
+/// already sets in `agent_args` wins over the config value. Returns whether
+/// the agent TUI should start fullscreen.
+fn apply_agent_config(
+    cfg: &HashMap<String, String>,
+    config_dir: &Path,
+    agent_args: &mut Vec<String>,
+) -> bool {
+    let already_set = |args: &[String], flag: &str| {
+        let prefix = format!("{}=", flag);
+        args.iter().any(|a| a == flag || a.starts_with(&prefix))
+    };
+
     for (key, flag) in [("agent_model", "--model"), ("agent_effort", "--effort")] {
         let Some(value) = cfg.get(key).filter(|v| !v.is_empty()) else {
             continue;
         };
-        let prefix = format!("{}=", flag);
-        if agent_args.iter().any(|a| a == flag || a.starts_with(&prefix)) {
+        if already_set(agent_args, flag) {
             continue;
         }
         agent_args.push(flag.to_string());
         agent_args.push(value.clone());
     }
+
+    if let Some(value) = cfg.get("agent_mcp_config").filter(|v| !v.is_empty()) {
+        if !already_set(agent_args, "--mcp-config") {
+            let configs = resolve_mcp_configs(value, config_dir);
+            if !configs.is_empty() {
+                agent_args.push("--mcp-config".to_string());
+                agent_args.extend(configs);
+            }
+        }
+    }
+
     cfg.get("agent_fullscreen").map(|v| config_flag(v)).unwrap_or(false)
+}
+
+/// Turn an `mcp_config` value into `--mcp-config` arguments. The value is
+/// either inline JSON (passed through as is) or a comma/space separated list
+/// of files; `~/` is expanded and relative paths are taken from the config
+/// file's directory. Files that do not exist are skipped with a warning, since
+/// the agent refuses to start on a missing MCP config.
+fn resolve_mcp_configs(value: &str, config_dir: &Path) -> Vec<String> {
+    let value = value.trim();
+    if value.starts_with('{') {
+        return vec![value.to_string()];
+    }
+    let mut out = Vec::new();
+    for item in value.split(|c: char| c == ',' || c.is_whitespace()) {
+        if item.is_empty() {
+            continue;
+        }
+        let path = if let Some(rest) = item.strip_prefix("~/") {
+            home_dir().join(rest)
+        } else if Path::new(item).is_absolute() {
+            PathBuf::from(item)
+        } else {
+            config_dir.join(item)
+        };
+        if path.is_file() {
+            out.push(path.to_string_lossy().to_string());
+        } else {
+            eprintln!("[latch-run] mcp_config not found, skipped: {}", path.display());
+        }
+    }
+    out
 }
 
 /// Size of the terminal latch-run itself is attached to (80x24 when detached).
@@ -772,6 +828,7 @@ mod tests {
         let mut args = Vec::new();
         let full = apply_agent_config(
             &cfg(&[("agent_model", "fable"), ("agent_effort", "low"), ("agent_fullscreen", "true")]),
+            Path::new("/nonexistent"),
             &mut args,
         );
         assert!(full);
@@ -781,7 +838,11 @@ mod tests {
     #[test]
     fn tick_args_win_over_config() {
         let mut args = vec!["--effort=high".to_string()];
-        let full = apply_agent_config(&cfg(&[("agent_model", "fable"), ("agent_effort", "low")]), &mut args);
+        let full = apply_agent_config(
+            &cfg(&[("agent_model", "fable"), ("agent_effort", "low")]),
+            Path::new("/nonexistent"),
+            &mut args,
+        );
         assert!(!full);
         assert_eq!(args, ["--effort=high", "--model", "fable"]);
     }
@@ -800,9 +861,40 @@ mod tests {
     }
 
     #[test]
+    fn mcp_config_paths_are_resolved() {
+        let dir = env::temp_dir().join(format!("latch-run-mcp-test-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let shared = dir.join("shared.json");
+        fs::write(&shared, "{}").unwrap();
+        let shared_str = shared.to_string_lossy().to_string();
+
+        // relative to the config dir, absolute, and a missing file that is skipped
+        let value = format!("shared.json, {} missing.json", shared_str);
+        assert_eq!(resolve_mcp_configs(&value, &dir), [shared_str.clone(), shared_str.clone()]);
+
+        // inline JSON is passed through whole
+        let inline = r#"{"mcpServers": {"a": {"command": "x"}}}"#;
+        assert_eq!(resolve_mcp_configs(inline, &dir), [inline]);
+
+        let mut args = Vec::new();
+        apply_agent_config(&cfg(&[("agent_mcp_config", "shared.json")]), &dir, &mut args);
+        assert_eq!(args, ["--mcp-config".to_string(), shared_str.clone()]);
+
+        // the tick's own flag wins; a value with no usable file adds nothing
+        let mut args = vec!["--mcp-config".to_string(), "own.json".to_string()];
+        apply_agent_config(&cfg(&[("agent_mcp_config", "shared.json")]), &dir, &mut args);
+        assert_eq!(args, ["--mcp-config", "own.json"]);
+        let mut args = Vec::new();
+        apply_agent_config(&cfg(&[("agent_mcp_config", "missing.json")]), &dir, &mut args);
+        assert!(args.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn empty_config_changes_nothing() {
         let mut args = vec!["--verbose".to_string()];
-        assert!(!apply_agent_config(&HashMap::new(), &mut args));
+        assert!(!apply_agent_config(&HashMap::new(), Path::new("/nonexistent"), &mut args));
         assert_eq!(args, ["--verbose"]);
     }
 }

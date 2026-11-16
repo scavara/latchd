@@ -1,6 +1,7 @@
 # latchd config: `key = value`, one per line. Installed to ~/.config/latchd/config.
-# These three control how latch-run starts the agent for every tick; a tick's
-# own `agent_args:` header wins when it sets the same flag.
+# The settings at the top control how latch-run starts the agent for every
+# tick. A `[tick]` section further down overrides them for one tick, and a
+# tick's own `agent_args:` header wins over both when it sets the same flag.
 
 # Model passed as `--model`. `fable` is the alias for the latest model.
 agent_model = fable
@@ -10,3 +11,17 @@ agent_effort = low
 
 # Start the agent TUI in fullscreen (alt-screen) mode.
 agent_fullscreen = true
+
+# MCP servers passed as `--mcp-config`: one or more JSON files (comma or space
+# separated; `~/` works, other relative paths are relative to this file).
+# agent_mcp_config = mcp/shared.json
+
+# Per-tick overrides. The section name is the tick id (`incident`) or its file
+# name without `.md` (`99-incident`). Inside a section `model`, `effort`,
+# `mcp_config` and `fullscreen` may be written without the `agent_` prefix.
+# Several ticks can point at the same mcp_config file to share MCP servers.
+#
+# [incident]
+# model = opus
+# effort = high
+# mcp_config = mcp/incident.json

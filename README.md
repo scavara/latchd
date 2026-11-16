@@ -111,8 +111,27 @@ every tick it starts:
 | `agent_model` | `fable` | Passed to the agent as `--model` (`fable` is the latest-model alias) |
 | `agent_effort` | `low` | Passed as `--effort`; the agent's own default is `medium` |
 | `agent_fullscreen` | `true` | Starts the agent TUI in fullscreen (sets `CLAUDE_CODE_NO_FLICKER=1`) |
+| `agent_mcp_config` | `mcp/shared.json` | Passed as `--mcp-config`: one or more JSON files, comma or space separated |
 
-A tick's `agent_args:` header wins when it sets the same flag. Editing the file
+A `[tick]` section overrides these for one tick. The section name is the tick
+id or its file name without `.md`, and inside it the `agent_` prefix is
+optional:
+
+```
+agent_model = fable
+agent_effort = low
+
+[incident]
+model = opus
+effort = high
+mcp_config = mcp/incident.json
+```
+
+Relative `mcp_config` paths are relative to the config file, `~/` is expanded,
+and a file that does not exist is skipped with a warning. Several ticks can
+name the same file to share MCP servers.
+
+A tick's `agent_args:` header wins over both when it sets the same flag. Editing the file
 restarts running ticks that opted into `change`. `LATCH_CONFIG_FILE` points the
 runner at a different file.
 

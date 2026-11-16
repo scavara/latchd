@@ -119,4 +119,4 @@ snapshot instead, which is what the test suite uses.
 against scratch directories (nothing touches your real state). Suites cover
 claims, directives and maintenance windows, heartbeat sweeps, rollouts, hook
 refusal and notices, the runner lifecycle, the launcher and manifest tooling,
-the dashboard snapshot, and the stale runner sweep.
+the dashboard snapshot, the stale runner sweep, and per-tick configuration.
