@@ -67,6 +67,14 @@ agent and the rest of the system:
   inside a tick session, and never the prompt or `TICK` wake-ups the runner
   sends itself) and answers given with `answered`. Text is capped at 400
   characters.
+- `digest <node>... [--action blame|restart|reboot|escalate] [--within 24h]
+  [--max-age 24h] [--refresh] [--json]`: the pre-action check. It gathers what
+  is known about maintenance on each node and exits 0 (`clear`), 1 (`caution`)
+  or 2 (`hold`). Active maintenance windows and block directives hold; upstream
+  notices, maintenance or directives starting within `--within`, other active
+  directives, an active rollout that still has the node open, and an upstream
+  cache older than `--max-age` are cautions. Each run is logged as a `digest`
+  event.
 - `heartbeat`: records the nodes a session is actively using so the sweeper
   leaves those claims alone.
 - `rollout start | mark | phase | note | state | ls | show`: tracks multi-step
@@ -125,5 +133,5 @@ snapshot instead, which is what the test suite uses.
 against scratch directories (nothing touches your real state). Suites cover
 claims, directives and maintenance windows, heartbeat sweeps, rollouts, hook
 refusal and notices, the runner lifecycle, the launcher and manifest tooling,
-the dashboard snapshot, the stale runner sweep, per-tick configuration, and
-the session audit log.
+the dashboard snapshot, the stale runner sweep, per-tick configuration, the
+session audit log, and the pre-action digest.

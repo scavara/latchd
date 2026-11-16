@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import fnmatch
 import json
 import os
@@ -573,10 +574,16 @@ def cmd_rollout(args) -> int:
 
 def parse_nodes_config() -> dict:
     groups = {}
+    seen = set()
     for base in (config_dir(), latchd_config_dir()):
         p = base / "nodes"
         if not p.exists():
             continue
+        # Both config dirs may be the same place; read the file once.
+        real = p.resolve()
+        if real in seen:
+            continue
+        seen.add(real)
         current = "default"
         for raw in p.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
@@ -707,6 +714,171 @@ def cmd_notices_ls(args) -> int:
         regions = ",".join(str(x) for x in (n.get("regions") or [])) or "-"
         print(f"[{n.get('provider', '?')}] {n.get('title', 'advisory')} (regions: {regions}; nodes: {nodes})")
     return 0
+
+
+DIGEST_LEVELS = {"clear": 0, "caution": 1, "hold": 2}
+DIGEST_ACTIONS = ("blame", "restart", "reboot", "escalate")
+
+
+def directive_matches_node(node: str, patterns) -> bool:
+    """Same matching latchd applies to directive node patterns."""
+    for pat in patterns or []:
+        if not isinstance(pat, str):
+            continue
+        if pat in ("*", "all") or pat == node:
+            return True
+        if pat.endswith("*") and node.startswith(pat[:-1]):
+            return True
+    return False
+
+
+def fmt_ts(ts) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
+
+
+def digest_node(node: str, now: int, within: int, directives: list, notices: list, rollouts: list) -> list:
+    """Everything known that argues against acting on `node` right now, as
+    {level, kind, text} findings. Pure: all inputs are passed in."""
+    findings = []
+    for d in directives:
+        if not isinstance(d, dict) or not directive_matches_node(node, d.get("nodes")):
+            continue
+        until = d.get("until_ts")
+        if not isinstance(until, int) or until <= now:
+            continue
+        start = d.get("from_ts") if isinstance(d.get("from_ts"), int) else None
+        text = str(d.get("text", ""))
+        mode = d.get("mode")
+        is_maint = text.startswith("maintenance:")
+        label = f"{'maintenance' if is_maint else 'directive'} #{d.get('id', '?')}"
+        if start is not None and start > now:
+            if start - now <= within:
+                findings.append({
+                    "level": "caution",
+                    "kind": "maintenance_upcoming" if is_maint else "directive_upcoming",
+                    "text": f"{label} starts {fmt_ts(start)} (until {fmt_ts(until)}): {text}",
+                })
+            continue
+        if is_maint or mode == "block":
+            findings.append({
+                "level": "hold",
+                "kind": "maintenance_active" if is_maint else "directive_block",
+                "text": f"{label} active until {fmt_ts(until)}: {text}",
+            })
+        elif mode != "prio_floor":
+            findings.append({
+                "level": "caution",
+                "kind": f"directive_{mode}",
+                "text": f"{label} ({mode}) active until {fmt_ts(until)}: {text}",
+            })
+    for n in notices:
+        if isinstance(n, dict) and notice_matches_nodes(n, [node]):
+            regions = ",".join(str(x) for x in (n.get("regions") or [])) or "-"
+            findings.append({
+                "level": "caution",
+                "kind": "upstream_notice",
+                "text": f"upstream notice [{n.get('provider', '?')}] {n.get('title', 'advisory')} (regions: {regions})",
+            })
+    for r in rollouts:
+        if r["node"] == node:
+            findings.append({
+                "level": "caution",
+                "kind": "rollout_active",
+                "text": f"rollout #{r['id']} {r['name']} [{r['phase']}] has this node as {r['status']}",
+            })
+    return findings
+
+
+def active_rollout_nodes() -> list:
+    db_path = handover_dir() / "rollouts.db"
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT r.id AS id, r.name AS name, r.phase AS phase, n.node AS node, n.status AS status "
+            "FROM rollouts r JOIN rollout_nodes n ON n.rollout_id = r.id "
+            "WHERE r.state = 'active' AND n.status NOT IN ('done', 'skipped')"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except sqlite3.Error:
+        return []
+
+
+def cmd_digest(args) -> int:
+    now = now_epoch()
+    within = parse_time_spec(args.within, 0)
+    max_age = parse_time_spec(args.max_age, 0)
+    if args.refresh:
+        try:
+            with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+                cmd_notices_fetch(args)
+        except Exception as exc:  # a broken feed must not hide local findings
+            sys.stderr.write(f"notices refresh failed: {exc}\n")
+
+    directives = load_json_file(handover_dir() / "directives.json", [])
+    if not isinstance(directives, list):
+        directives = []
+    notices_path = handover_dir() / "notices.json"
+    notices = load_json_file(notices_path, [])
+    if not isinstance(notices, list):
+        notices = []
+    rollouts = active_rollout_nodes()
+
+    general = []
+    if notices_path.exists():
+        age = now - int(notices_path.stat().st_mtime)
+        if age > max_age:
+            general.append({
+                "level": "caution",
+                "kind": "digest_stale",
+                "text": f"upstream notices were last fetched {age // 3600}h ago; run `latch-note notices fetch` (or pass --refresh)",
+            })
+
+    nodes = {}
+    worst = "clear"
+    for node in args.nodes:
+        findings = digest_node(node, now, within, directives, notices, rollouts) + general
+        verdict = max((f["level"] for f in findings), key=DIGEST_LEVELS.get, default="clear")
+        nodes[node] = {"verdict": verdict, "findings": findings}
+        worst = max(worst, verdict, key=DIGEST_LEVELS.get)
+
+    payload = {
+        "ts": now,
+        "tick": current_session(),
+        "action": args.action,
+        "verdict": worst,
+        "nodes": nodes,
+        "upstream_digest_cached": notices_path.exists(),
+    }
+    append_event("digest", {
+        "tick": payload["tick"],
+        "action": args.action,
+        "verdict": worst,
+        "nodes": {n: v["verdict"] for n, v in nodes.items()},
+    })
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        what = args.action or "act on"
+        for node, info in nodes.items():
+            print(f"{node}: {info['verdict'].upper()}")
+            for f in info["findings"]:
+                print(f"  [{f['level']}] {f['text']}")
+            if not info["findings"]:
+                print("  nothing known against it")
+        if not notices_path.exists():
+            print("note: no upstream notices cached; run `latch-note notices fetch`")
+        if worst == "hold":
+            print(f"=> HOLD: do not {what} automatically. This is expected maintenance; leave the host alone.")
+        elif worst == "caution":
+            print(f"=> CAUTION: do not {what} automatically. Ask the operator first (`latch-note ask`).")
+        else:
+            print(f"=> CLEAR: nothing known that argues against it; you may {what}.")
+    return DIGEST_LEVELS[worst]
 
 
 def load_node_regex() -> re.Pattern:
@@ -877,6 +1049,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_said.add_argument("-n", "--last", type=int, default=None, help="only the last N records")
     p_said.add_argument("--json", action="store_true")
 
+    p_digest = sub.add_parser(
+        "digest",
+        help="what is known about maintenance on nodes; exit 0 clear, 1 caution, 2 hold",
+    )
+    p_digest.add_argument("nodes", nargs="+")
+    p_digest.add_argument("--action", choices=DIGEST_ACTIONS, default=None,
+                          help="what the tick is about to do")
+    p_digest.add_argument("--within", default="24h",
+                          help="flag maintenance starting within this long (default 24h)")
+    p_digest.add_argument("--max-age", default="24h",
+                          help="flag cached upstream notices older than this (default 24h)")
+    p_digest.add_argument("--refresh", action="store_true",
+                          help="fetch upstream notices first")
+    p_digest.add_argument("--json", action="store_true")
+
     p_roll = sub.add_parser("rollout")
     rsub = p_roll.add_subparsers(dest="rollout_cmd", required=True)
 
@@ -954,6 +1141,7 @@ def main() -> int:
         "ask": cmd_ask,
         "answered": cmd_answered,
         "said": cmd_said,
+        "digest": cmd_digest,
         "rollout": cmd_rollout,
         "notices": lambda a: cmd_notices_ls(a) if a.notices_cmd == "ls" else cmd_notices_fetch(a),
         "nodes": cmd_nodes_check,

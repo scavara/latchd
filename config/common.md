@@ -12,6 +12,13 @@ Every watch tick session follows these standing rules on each tick and interacti
    work to the holding tick with `latch-note send`.
 4. **Questions.** When human confirmation is required before a destructive action or maintenance
    window, run `latch-note ask "<question>" <nodes>` and emit `[needs-you]` until answered.
-5. **Incident standby.** A tick with `role: incident` runs with no scheduled ticks, claims
+5. **Check the digest before acting on a host.** Before you blame a host for a fault, restart
+   a service on it, reboot it, or escalate it, run
+   `latch-note digest <node> --action blame|restart|reboot|escalate`. Exit status 0 (`CLEAR`)
+   means go ahead. Status 1 (`CAUTION`: upstream notice, maintenance starting soon, rollout in
+   progress) means do not act on your own: ask with `latch-note ask` and wait. Status 2
+   (`HOLD`: maintenance or a block is active) means the fault is expected: leave the host alone
+   and note it in your heartbeat. Treat any other failure of the command as `CAUTION`.
+6. **Incident standby.** A tick with `role: incident` runs with no scheduled ticks, claims
    nodes at `p9`, and may only run `latchd take <node>` within 60 minutes of the user naming
    that node directly in its prompt.
