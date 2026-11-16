@@ -6,10 +6,42 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use std::env;
 use std::io::{self, stdout};
+
+/// Colour band for a claim priority: incident-level red, elevated yellow,
+/// normal green, low blue.
+fn prio_color(prio: u8) -> Color {
+    match prio {
+        8..=u8::MAX => Color::Red,
+        6..=7 => Color::Yellow,
+        4..=5 => Color::Green,
+        _ => Color::Blue,
+    }
+}
+
+fn prio_style(prio: u8) -> Style {
+    let style = Style::default().fg(prio_color(prio));
+    if prio >= 8 {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+/// One claim as a line whose priority tag (and node name) carry the colour.
+fn claim_line(c: &state::ClaimEntry, joiner: &str, node_width: usize) -> Line<'static> {
+    let style = prio_style(c.prio);
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{:<width$}", c.node, width = node_width), style),
+        Span::raw(format!(" {} {} ", joiner, c.holder)),
+        Span::styled(format!("(p{})", c.prio), style),
+    ])
+}
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -72,15 +104,16 @@ fn main() -> io::Result<()> {
             f.render_widget(title_p, rows[0]);
 
             // 2. Overview Row
-            let mut overview_text = format!("Claims ({}):\n", snap_data.claims.len());
+            let mut overview_lines =
+                vec![Line::from(format!("Claims ({}):", snap_data.claims.len()))];
             if snap_data.claims.is_empty() {
-                overview_text.push_str("  (no active host claims)\n");
+                overview_lines.push(Line::from("  (no active host claims)"));
             } else {
                 for c in &snap_data.claims {
-                    overview_text.push_str(&format!("  {} -> {} (p{})\n", c.node, c.holder, c.prio));
+                    overview_lines.push(claim_line(c, "->", 0));
                 }
             }
-            let overview_p = Paragraph::new(overview_text).block(
+            let overview_p = Paragraph::new(overview_lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
@@ -171,15 +204,15 @@ fn main() -> io::Result<()> {
                 ])
                 .split(rows[3]);
 
-            let mut hq_text = String::new();
+            let mut hq_lines = Vec::new();
             if snap_data.claims.is_empty() {
-                hq_text.push_str("  All host queues idle\n");
+                hq_lines.push(Line::from("  All host queues idle"));
             } else {
                 for c in &snap_data.claims {
-                    hq_text.push_str(&format!("  {:<20} locked by {} (p{})\n", c.node, c.holder, c.prio));
+                    hq_lines.push(claim_line(c, "locked by", 20));
                 }
             }
-            let hq_p = Paragraph::new(hq_text).block(
+            let hq_p = Paragraph::new(hq_lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
@@ -229,3 +262,31 @@ fn main() -> io::Result<()> {
 }
 
 fn arguments_exit() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_bands() {
+        assert_eq!(prio_color(9), Color::Red);
+        assert_eq!(prio_color(8), Color::Red);
+        assert_eq!(prio_color(7), Color::Yellow);
+        assert_eq!(prio_color(6), Color::Yellow);
+        assert_eq!(prio_color(5), Color::Green);
+        assert_eq!(prio_color(4), Color::Green);
+        assert_eq!(prio_color(3), Color::Blue);
+        assert_eq!(prio_color(1), Color::Blue);
+        assert!(prio_style(9).add_modifier.contains(Modifier::BOLD));
+        assert!(!prio_style(7).add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn claim_line_text_and_colour() {
+        let c = state::ClaimEntry { node: "ab1001".into(), holder: "tick-a".into(), prio: 7 };
+        let line = claim_line(&c, "->", 0);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "  ab1001 -> tick-a (p7)");
+        assert_eq!(line.spans[3].style.fg, Some(Color::Yellow));
+    }
+}

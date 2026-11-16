@@ -4,11 +4,11 @@ This project is under active development. The core daemon, locking engine, and T
 
 ## Upcoming Features (Next 20-30 Hours)
 
-- [ ] **JSON Export for Rollouts:** Add a `--json` flag to `latch-note rollout show` to enable automated parsing of active rollout states by external monitoring scripts.
-- [ ] **Priority-Floor Expiry Cleanup:** Implement automatic timestamp expiration and cleanup for `prio_floor` directives inside the `latchd/src/directives.rs` state engine.
-- [ ] **Stale Socket Sweeps:** Add a cleanup routine in `latch-up` (the launcher) to detect and remove orphaned `.sock` files when a runner PID dies unexpectedly.
-- [ ] **Notice Filtering by Node:** Expand the `latch-note notices` CLI to allow filtering cached hardware/upstream notices by specific target nodes.
-- [ ] **Dashboard Color Coding:** Upgrade the read-only `ratatui` dashboard to use priority-based color coding for the active claims list.
+- [x] **JSON Export for Rollouts:** Add a `--json` flag to `latch-note rollout show` to enable automated parsing of active rollout states by external monitoring scripts.
+- [x] **Priority-Floor Expiry Cleanup:** Implement automatic timestamp expiration and cleanup for `prio_floor` directives inside the `latchd/src/directives.rs` state engine.
+- [x] **Stale Socket Sweeps:** Add a cleanup routine in `latch-up` (the launcher) to detect and remove orphaned `.sock` files when a runner PID dies unexpectedly.
+- [x] **Notice Filtering by Node:** Expand the `latch-note notices` CLI to allow filtering cached hardware/upstream notices by specific target nodes.
+- [x] **Dashboard Color Coding:** Upgrade the read-only `ratatui` dashboard to use priority-based color coding for the active claims list.
 
 ## Phase 2: Advanced Coordination & UI
 

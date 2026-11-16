@@ -40,6 +40,8 @@ node), `queue` (waiters, keyed by node and waiter) and `take_grants`.
   (`latch-note heartbeat` writes `$LATCH_HANDOVER_DIR/peers/<tick>.json`, valid
   for twice the tick interval). When a waiter's effective
   priority is at least the holder's plus 2, a `yield_request` event is logged.
+  The sweep also removes `prio_floor` directives whose end time has passed
+  (logged as `directive_expired`).
 - **Incident take:** `latchd grant-take` records that a session may take over a
   node; `latchd take` then claims it at priority 9.
 
@@ -65,6 +67,8 @@ agent and the rest of the system:
   changes.
 - `nodes check`, `notices fetch`: validate the `nodes` file and pull advisories
   from the sources it lists (JSON or RSS/Atom) into `notices.json`.
+- `notices ls [--node NODE]... [--json]`: list the cached notices, optionally
+  only those targeting the given nodes.
 
 ### latch-run and latch-up (`crates/runner`, `crates/launcher`)
 
@@ -81,7 +85,9 @@ It also serves a Unix-socket control interface (`tick`, `pause`, `resume`,
 `change` (the tick file or `common.md` changed).
 
 `latch-up` is the operator front end: `start | stop | restart | pause | resume
-| tick | status [--json]` for one tick or `all`.
+| tick | status [--json]` for one tick or `all`. `latch-up sweep` (also run
+before every `start`) removes the registry entry and socket of runners whose
+process is gone.
 
 ### Shared crates
 
@@ -112,5 +118,5 @@ snapshot instead, which is what the test suite uses.
 `tests/run.sh` builds the workspace and runs each `tests/suites/NN-*.sh`
 against scratch directories (nothing touches your real state). Suites cover
 claims, directives and maintenance windows, heartbeat sweeps, rollouts, hook
-refusal, the runner lifecycle, the launcher and manifest tooling, and the
-dashboard snapshot.
+refusal and notices, the runner lifecycle, the launcher and manifest tooling,
+the dashboard snapshot, and the stale runner sweep.
