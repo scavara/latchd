@@ -34,3 +34,26 @@ fi
 
 "$LATCH_NOTE" maintenance "Switch upgrade" ab1002 --from +10m --until +40m | grep -q "maintenance #4"
 "$LATCHD" claim ab1002 --holder tick-a -p 8 | grep -q "renewed ab1002"
+
+# expired prio_floor directives are removed by the sweep; everything else stays
+python3 - "$LATCH_HANDOVER_DIR/directives.json" << 'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+for d in data:
+    if d["id"] in (1, 3):
+        d["until_ts"] -= 3600
+json.dump(data, open(path, "w"), indent=2)
+PY
+"$LATCHD" sweep | grep -q "expired prio_floor directive #3"
+python3 - "$LATCH_HANDOVER_DIR/directives.json" << 'PY'
+import json, sys
+ids = [d["id"] for d in json.load(open(sys.argv[1]))]
+assert ids == [1, 2, 4], ids
+PY
+grep -q '"directive_expired"' "$LATCHD_DIR/events.jsonl"
+if "$LATCHD" sweep | grep -q "expired prio_floor"; then
+    exit 1
+fi
+"$LATCHD" release testhost-a --holder tick-b > /dev/null
+"$LATCHD" claim testhost-a --holder tick-c -p 4 | grep -q "claimed testhost-a for tick-c (p4)"
