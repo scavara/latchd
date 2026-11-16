@@ -15,19 +15,22 @@ pub fn load_directives() -> Vec<Directive> {
     serde_json::from_str(&data).unwrap_or_default()
 }
 
-/// Split raw directive records into those to keep and the ids of `prio_floor`
-/// directives whose `until_ts` has passed. Other modes are never dropped, and
-/// records are kept as raw JSON so fields this build does not know survive.
-fn split_expired_floors(
+/// Split raw directive records into those to keep and the ids of expired
+/// directives that clean themselves up: `prio_floor` directives and synced
+/// ones (`latch-note directive sync`) whose `until_ts` has passed. Others are
+/// never dropped, and records are kept as raw JSON so fields this build does
+/// not know survive.
+fn split_expired(
     records: Vec<serde_json::Value>,
     now: i64,
 ) -> (Vec<serde_json::Value>, Vec<u64>) {
     let mut kept = Vec::new();
     let mut expired = Vec::new();
     for rec in records {
-        let is_floor = rec["mode"].as_str() == Some("prio_floor");
+        let self_cleaning =
+            rec["mode"].as_str() == Some("prio_floor") || rec["sync_name"].is_string();
         let until = rec["until_ts"].as_i64();
-        if is_floor && until.is_some_and(|u| u <= now) {
+        if self_cleaning && until.is_some_and(|u| u <= now) {
             expired.push(rec["id"].as_u64().unwrap_or(0));
         } else {
             kept.push(rec);
@@ -36,9 +39,9 @@ fn split_expired_floors(
     (kept, expired)
 }
 
-/// Remove expired `prio_floor` directives from `directives.json`. Returns the
-/// ids removed. A missing or malformed file is left untouched.
-pub fn prune_expired_prio_floors() -> Vec<u64> {
+/// Remove expired `prio_floor` and synced directives from `directives.json`.
+/// Returns the ids removed. A missing or malformed file is left untouched.
+pub fn prune_expired_directives() -> Vec<u64> {
     let path = directives_path();
     let Ok(data) = fs::read_to_string(&path) else {
         return Vec::new();
@@ -46,7 +49,7 @@ pub fn prune_expired_prio_floors() -> Vec<u64> {
     let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&data) else {
         return Vec::new();
     };
-    let (kept, expired) = split_expired_floors(records, now_epoch());
+    let (kept, expired) = split_expired(records, now_epoch());
     if expired.is_empty() {
         return expired;
     }
@@ -148,18 +151,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn only_expired_floors_are_dropped() {
+    fn only_expired_self_cleaning_directives_are_dropped() {
         let records = vec![
             json!({"id": 1, "mode": "prio_floor", "until_ts": 100, "extra": "kept"}),
             json!({"id": 2, "mode": "prio_floor", "until_ts": 50}),
             json!({"id": 3, "mode": "block", "until_ts": 50}),
             json!({"id": 4, "mode": "prio_floor"}),
             json!({"id": 5, "mode": "prio_floor", "until_ts": 60}),
+            json!({"id": 6, "mode": "block", "until_ts": 50, "sync_name": "decom"}),
+            json!({"id": 7, "mode": "block", "until_ts": 100, "sync_name": "decom2"}),
         ];
-        let (kept, expired) = split_expired_floors(records, 60);
-        assert_eq!(expired, vec![2, 5]);
+        let (kept, expired) = split_expired(records, 60);
+        assert_eq!(expired, vec![2, 5, 6]);
         let ids: Vec<u64> = kept.iter().map(|r| r["id"].as_u64().unwrap()).collect();
-        assert_eq!(ids, vec![1, 3, 4]);
+        assert_eq!(ids, vec![1, 3, 4, 7]);
         assert_eq!(kept[0]["extra"], "kept");
     }
 }

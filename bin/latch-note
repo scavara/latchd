@@ -294,6 +294,140 @@ def cmd_heartbeat(args) -> int:
     return 0
 
 
+def directive_mode(args):
+    """(mode, owner, prio, pause_target) from the directive mode flags."""
+    if getattr(args, "warn", False):
+        return "warn", None, None, None
+    if getattr(args, "owner", None):
+        return "owner", args.owner, None, None
+    if getattr(args, "min_prio", None) is not None:
+        return "min_prio", None, int(args.min_prio), None
+    if getattr(args, "prio_floor", None) is not None:
+        return "prio_floor", None, int(args.prio_floor), None
+    if getattr(args, "pause", None):
+        return "pause", None, None, args.pause
+    return "block", None, None, None
+
+
+# A synced directive lapses this long after its last sync: a daily sync plus
+# two hours of slack.
+SYNC_TTL_SECS = 26 * 3600
+
+
+def cmd_directive_sync(args) -> int:
+    """Keep the directive called NAME on exactly the hosts given in this call.
+    Hosts that are no longer given drop off at once, no hosts removes the
+    directive, and without a further sync it expires after SYNC_TTL_SECS."""
+    now = now_epoch()
+    d_path = handover_dir() / "directives.json"
+    directives = load_json_file(d_path, [])
+    if not isinstance(directives, list):
+        directives = []
+
+    # Synced directives whose sync has stopped are dead weight: drop them.
+    kept = []
+    lapsed = []
+    for d in directives:
+        if isinstance(d, dict) and d.get("sync_name") and int(d.get("until_ts") or 0) <= now:
+            lapsed.append(d)
+        else:
+            kept.append(d)
+    directives = kept
+
+    if args.list:
+        if lapsed:
+            save_json_file(d_path, directives)
+        synced = [d for d in directives if isinstance(d, dict) and d.get("sync_name")]
+        if args.json:
+            print(json.dumps(synced, indent=2))
+            return 0
+        if not synced:
+            print("no synced directives")
+        for d in synced:
+            age_min = (now - int(d.get("synced_at") or now)) // 60
+            print(
+                f"{d['sync_name']}: directive #{d.get('id', '?')} ({d.get('mode', '?')}) on "
+                f"{', '.join(d.get('nodes') or [])}; synced {age_min}m ago, "
+                f"expires {fmt_ts(d['until_ts'])}: {d.get('text', '')}"
+            )
+        return 0
+
+    if not args.name:
+        sys.stderr.write("directive sync: NAME is required\n")
+        return 2
+    hosts = sorted({h for item in args.nodes for h in item.split(",") if h})
+    existing = next(
+        (d for d in directives if isinstance(d, dict) and d.get("sync_name") == args.name), None
+    )
+
+    if not hosts:
+        if existing is None:
+            if lapsed:
+                save_json_file(d_path, directives)
+            print(f"{args.name}: no hosts present, nothing to sync")
+            return 0
+        directives.remove(existing)
+        save_json_file(d_path, directives)
+        append_event("directive_sync", {"name": args.name, "id": existing.get("id"), "action": "removed"})
+        print(f"{args.name}: directive #{existing.get('id')} removed (no hosts present)")
+        return 0
+
+    mode, owner, prio, pause_target = directive_mode(args)
+    until_ts = now + SYNC_TTL_SECS
+    if existing is None:
+        if not args.text:
+            sys.stderr.write(f"directive sync: {args.name} is new, so --text is required\n")
+            return 2
+        rec_id = max((d.get("id", 0) for d in directives if isinstance(d, dict)), default=0) + 1
+        existing = {"id": rec_id, "sync_name": args.name, "from_ts": None, "announced_start": True}
+        directives.append(existing)
+        action = "created"
+        dropped = []
+    else:
+        action = "updated"
+        dropped = sorted(set(existing.get("nodes") or []) - set(hosts))
+    existing.update({
+        "text": args.text or existing.get("text", ""),
+        "nodes": hosts,
+        "mode": mode,
+        "owner": owner,
+        "prio": prio,
+        "pause_target": pause_target,
+        "until_ts": until_ts,
+        "synced_at": now,
+    })
+    save_json_file(d_path, directives)
+    append_event("directive_sync", {
+        "name": args.name, "id": existing["id"], "action": action,
+        "nodes": hosts, "dropped": dropped, "until_ts": until_ts,
+    })
+    line = f"{args.name}: directive #{existing['id']} {action} ({mode}) on {', '.join(hosts)}; expires {fmt_ts(until_ts)}"
+    if dropped:
+        line += f"; dropped {', '.join(dropped)}"
+    print(line)
+    return 0
+
+
+def build_sync_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="latch-note directive sync",
+        description="Keep a named directive on exactly the hosts present in this call. "
+        "It expires 26 hours after the last sync.",
+    )
+    p.add_argument("name", nargs="?", default=None, help="name identifying the synced directive")
+    p.add_argument("nodes", nargs="*", help="hosts present now (none: remove the directive)")
+    p.add_argument("--text", default=None, help="directive text (required the first time)")
+    p.add_argument("--block", action="store_true")
+    p.add_argument("--warn", action="store_true")
+    p.add_argument("--owner", default=None)
+    p.add_argument("--min-prio", type=int, default=None)
+    p.add_argument("--prio-floor", type=int, default=None)
+    p.add_argument("--pause", default=None)
+    p.add_argument("--list", action="store_true", help="show synced directives instead of syncing")
+    p.add_argument("--json", action="store_true", help="with --list: JSON output")
+    return p
+
+
 def cmd_directive(args) -> int:
     now = now_epoch()
     until_ts = parse_time_spec(args.until, now)
@@ -302,25 +436,7 @@ def cmd_directive(args) -> int:
     directives = load_json_file(d_path, [])
     next_id = max((d.get("id", 0) for d in directives), default=0) + 1
 
-    mode = "block"
-    owner = None
-    prio = None
-    pause_target = None
-
-    if getattr(args, "warn", False):
-        mode = "warn"
-    elif getattr(args, "owner", None):
-        mode = "owner"
-        owner = args.owner
-    elif getattr(args, "min_prio", None) is not None:
-        mode = "min_prio"
-        prio = int(args.min_prio)
-    elif getattr(args, "prio_floor", None) is not None:
-        mode = "prio_floor"
-        prio = int(args.prio_floor)
-    elif getattr(args, "pause", None):
-        mode = "pause"
-        pause_target = args.pause
+    mode, owner, prio, pause_target = directive_mode(args)
 
     rec = {
         "id": next_id,
@@ -1130,6 +1246,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # `directive sync` has its own argument shape (no --until, hosts optional).
+    if sys.argv[1:3] == ["directive", "sync"]:
+        return cmd_directive_sync(build_sync_parser().parse_args(sys.argv[3:]))
     parser = build_parser()
     args = parser.parse_args()
     dispatch = {

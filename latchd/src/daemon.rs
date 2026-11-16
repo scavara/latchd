@@ -1,4 +1,4 @@
-use crate::directives::prune_expired_prio_floors;
+use crate::directives::prune_expired_directives;
 use crate::db::{heartbeat_protected_nodes, log_event, ClaimRow, QueueRow};
 use latch_core::now_epoch;
 use rusqlite::{params, Connection};
@@ -9,9 +9,9 @@ pub fn run_sweep(conn: &Connection) -> Result<Vec<String>, String> {
     let hb_protected = heartbeat_protected_nodes();
     let mut actions = Vec::new();
 
-    for id in prune_expired_prio_floors() {
-        log_event("directive_expired", json!({"id": id, "mode": "prio_floor"}));
-        actions.push(format!("expired prio_floor directive #{}", id));
+    for id in prune_expired_directives() {
+        log_event("directive_expired", json!({"id": id}));
+        actions.push(format!("expired directive #{} removed", id));
     }
 
     let mut stmt = conn

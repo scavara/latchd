@@ -19,7 +19,7 @@ This project is under active development. The core daemon, locking engine, and T
 - [ ] **Secure Grafana Service Integration:** Implement a local `msc-grafana` service. The service account token must be stored securely in an encrypted secrets file at rest (e.g., using `age` or `SOPS`) and unlocked at runtime via a heavily restricted master keyfile or interactive passphrase prompt.
 - [x] **Session Audit Log (`latch-note said`):** Add a command to export user prompts typed in tick tabs and answers to tick questions for local auditing, logging up to 400 characters.
 - [x] **Pre-Action Maintenance Checks:** Add a `latch-note digest` hook for ticks to query a generic upstream maintenance digest before allowing them to automatically blame, restart, reboot, or escalate a host.
-- [ ] **Directive Sync Service:** Add a `latch-note directive sync` mechanism to keep active directives tied strictly to the presence of specific hosts, expiring 26 hours after the last sync.
+- [x] **Directive Sync Service:** Add a `latch-note directive sync` mechanism to keep active directives tied strictly to the presence of specific hosts, expiring 26 hours after the last sync.
 
 ## Core Operational Principles
 

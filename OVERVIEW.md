@@ -40,8 +40,8 @@ node), `queue` (waiters, keyed by node and waiter) and `take_grants`.
   (`latch-note heartbeat` writes `$LATCH_HANDOVER_DIR/peers/<tick>.json`, valid
   for twice the tick interval). When a waiter's effective
   priority is at least the holder's plus 2, a `yield_request` event is logged.
-  The sweep also removes `prio_floor` directives whose end time has passed
-  (logged as `directive_expired`).
+  The sweep also removes `prio_floor` and synced directives whose end time has
+  passed (logged as `directive_expired`).
 - **Incident take:** `latchd grant-take` records that a session may take over a
   node; `latchd take` then claims it at priority 9.
 
@@ -59,6 +59,11 @@ agent and the rest of the system:
   which blocks the command. `prompt` records take grants when an operator
   prompt names a node. `state` writes the session's status file.
 - `directive`, `maintenance`: write operator directives (`directives.json`).
+- `directive sync NAME [host...] [--text T] [mode flags]`: keeps the directive
+  called NAME on exactly the hosts given in this call, for a script that
+  re-asserts it regularly. A host no longer given drops off at once, no hosts
+  removes the directive, and without a further sync it expires 26 hours after
+  the last one. `directive sync --list [--json]` shows them.
 - `send`, `inbox`, `ask`, `answered`: notes between sessions and questions to the
   operator.
 - `said [--tick T] [--since 2h] [--kind prompt|answer] [-n N] [--json]`:
@@ -134,4 +139,4 @@ against scratch directories (nothing touches your real state). Suites cover
 claims, directives and maintenance windows, heartbeat sweeps, rollouts, hook
 refusal and notices, the runner lifecycle, the launcher and manifest tooling,
 the dashboard snapshot, the stale runner sweep, per-tick configuration, the
-session audit log, and the pre-action digest.
+session audit log, the pre-action digest, and directive sync.

@@ -45,14 +45,14 @@ for d in data:
         d["until_ts"] -= 3600
 json.dump(data, open(path, "w"), indent=2)
 PY
-"$LATCHD" sweep | grep -q "expired prio_floor directive #3"
+"$LATCHD" sweep | grep -q "expired directive #3 removed"
 python3 - "$LATCH_HANDOVER_DIR/directives.json" << 'PY'
 import json, sys
 ids = [d["id"] for d in json.load(open(sys.argv[1]))]
 assert ids == [1, 2, 4], ids
 PY
 grep -q '"directive_expired"' "$LATCHD_DIR/events.jsonl"
-if "$LATCHD" sweep | grep -q "expired prio_floor"; then
+if "$LATCHD" sweep | grep -q "expired directive"; then
     exit 1
 fi
 "$LATCHD" release testhost-a --holder tick-b > /dev/null
