@@ -84,6 +84,63 @@ fn load_runner_states() -> Vec<RunnerState> {
     states
 }
 
+/// What to do with one registry entry / socket pair, given whether the
+/// runner PID recorded for it is alive (None: no registry entry) and whether
+/// anything is listening on the socket.
+fn is_stale(pid_alive: Option<bool>, socket_listening: bool) -> bool {
+    match pid_alive {
+        Some(alive) => !alive,
+        // A socket with no registry entry may belong to a runner that is
+        // just starting, so only a dead socket counts.
+        None => !socket_listening,
+    }
+}
+
+/// Remove registry entries and sockets left behind by runners that died
+/// without cleaning up. Returns the tick ids that were swept.
+fn sweep_stale() -> Vec<String> {
+    let state_dir = latchboard_state_dir();
+    let reg_dir = state_dir.join("runners");
+    let sock_dir = state_dir.join("sockets");
+    let mut swept = Vec::new();
+
+    let mut registered = std::collections::HashSet::new();
+    for st in load_runner_states() {
+        registered.insert(st.tick_id.clone());
+        // Checked directly: a dead runner must be found even where
+        // is_pid_alive is stubbed out.
+        let alive = unsafe { libc::kill(st.pid as i32, 0) == 0 };
+        if is_stale(Some(alive), false) {
+            let _ = fs::remove_file(reg_dir.join(format!("{}.json", st.tick_id)));
+            let _ = fs::remove_file(sock_dir.join(format!("{}.sock", st.tick_id)));
+            swept.push(st.tick_id);
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(&sock_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("sock") {
+                continue;
+            }
+            let Some(id) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+                continue;
+            };
+            if registered.contains(&id) {
+                continue;
+            }
+            let listening = UnixStream::connect(&p).is_ok();
+            if is_stale(None, listening) {
+                let _ = fs::remove_file(&p);
+                swept.push(id);
+            }
+        }
+    }
+
+    swept.sort();
+    swept
+}
+
 fn send_control(tick_id: &str, req: &ControlRequest) -> Result<ControlResponse, String> {
     let sock_path = latchboard_state_dir()
         .join("sockets")
@@ -153,6 +210,7 @@ Commands:
   pause <tick_id|all>
   resume <tick_id|all>
   tick <tick_id>
+  sweep
   status [--json]"
     );
     process::exit(2);
@@ -168,7 +226,19 @@ fn main() {
     let target = args.get(1).map(|s| s.as_str()).unwrap_or("all");
 
     match cmd {
+        "sweep" => {
+            let swept = sweep_stale();
+            for id in &swept {
+                println!("swept stale runner state for {}", id);
+            }
+            if swept.is_empty() {
+                println!("nothing to sweep");
+            }
+        }
         "start" => {
+            for id in sweep_stale() {
+                println!("swept stale runner state for {}", id);
+            }
             let ticks = discover_ticks();
             for (id, path) in ticks {
                 if target == "all" || target == id {
@@ -265,5 +335,20 @@ fn main() {
             }
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stale;
+
+    #[test]
+    fn stale_rules() {
+        // registered runner: only its PID matters
+        assert!(is_stale(Some(false), true));
+        assert!(!is_stale(Some(true), false));
+        // unregistered socket: stale only when nothing listens
+        assert!(is_stale(None, false));
+        assert!(!is_stale(None, true));
     }
 }
