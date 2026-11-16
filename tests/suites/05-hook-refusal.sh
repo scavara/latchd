@@ -33,6 +33,13 @@ INNER_EOF
 "$LATCH_NOTE" notices fetch > /dev/null
 grep -q "ab1001" "$LATCH_HANDOVER_DIR/notices.json"
 
+# cached notices can be listed and filtered by target node
+"$LATCH_NOTE" notices ls | grep -q "ab1001"
+"$LATCH_NOTE" notices ls --node ab1001 | grep -q "ab1001"
+"$LATCH_NOTE" notices ls --node no-such-node | grep -q "no notices for no-such-node"
+"$LATCH_NOTE" notices ls --node no-such-node,ab1001 --json | grep -q '"nodes"'
+[ "$("$LATCH_NOTE" notices ls --node no-such-node --json)" = "[]" ]
+
 "$LATCH_NOTE" hook pre-command --session tick-a --command "ssh ab1001 uptime"
 "$LATCHD" status | grep -q "ab1001 held by tick-a"
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -573,6 +574,40 @@ def cmd_notices_fetch(_args) -> int:
     return 0
 
 
+def notice_matches_nodes(notice: dict, wanted: list) -> bool:
+    """True when the notice targets any wanted node. Notice node entries may be
+    globs (ab10*); a notice with no node list matches nothing."""
+    targets = notice.get("nodes") or []
+    if not isinstance(targets, list):
+        return False
+    for want in wanted:
+        for target in targets:
+            if isinstance(target, str) and (target == want or fnmatch.fnmatchcase(want, target)):
+                return True
+    return False
+
+
+def cmd_notices_ls(args) -> int:
+    notices = load_json_file(handover_dir() / "notices.json", [])
+    if not isinstance(notices, list):
+        notices = []
+    notices = [n for n in notices if isinstance(n, dict)]
+    wanted = [n for item in (args.node or []) for n in item.split(",") if n]
+    if wanted:
+        notices = [n for n in notices if notice_matches_nodes(n, wanted)]
+    if args.json:
+        print(json.dumps(notices, indent=2))
+        return 0
+    if not notices:
+        print("no notices" + (f" for {', '.join(wanted)}" if wanted else ""))
+        return 0
+    for n in notices:
+        nodes = ",".join(str(x) for x in (n.get("nodes") or [])) or "-"
+        regions = ",".join(str(x) for x in (n.get("regions") or [])) or "-"
+        print(f"[{n.get('provider', '?')}] {n.get('title', 'advisory')} (regions: {regions}; nodes: {nodes})")
+    return 0
+
+
 def load_node_regex() -> re.Pattern:
     for base in (latchd_config_dir(), config_dir()):
         re_file = base / "node-re"
@@ -766,6 +801,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_notices = sub.add_parser("notices")
     nsub = p_notices.add_subparsers(dest="notices_cmd", required=True)
     nsub.add_parser("fetch")
+    n_ls = nsub.add_parser("ls")
+    n_ls.add_argument("--node", action="append", default=None,
+                      help="only notices targeting this node (repeatable, comma-separated)")
+    n_ls.add_argument("--json", action="store_true")
 
     p_nodes = sub.add_parser("nodes")
     ndsub = p_nodes.add_subparsers(dest="nodes_cmd", required=True)
@@ -802,7 +841,7 @@ def main() -> int:
         "ask": cmd_ask,
         "answered": cmd_answered,
         "rollout": cmd_rollout,
-        "notices": cmd_notices_fetch,
+        "notices": lambda a: cmd_notices_ls(a) if a.notices_cmd == "ls" else cmd_notices_fetch(a),
         "nodes": cmd_nodes_check,
         "hook": cmd_hook,
     }
