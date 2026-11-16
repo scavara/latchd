@@ -12,7 +12,7 @@ This project is under active development. The core daemon, locking engine, and T
 
 ## Phase 2: Advanced Coordination & UI
 
-- [ ] **TUI Slash Commands & Navigation:** Implement interactive slash commands in the dashboard (e.g., `/shutdown N|all`, `/close ro`) and single-key panel focus shortcuts (`d`, `o`, `m`, `h`, `w`, `n`).
+- [x] **TUI Slash Commands & Navigation:** Implement interactive slash commands in the dashboard (e.g., `/shutdown N|all`, `/close ro`) and single-key panel focus shortcuts (`d`, `o`, `m`, `h`, `w`, `n`).
 - [ ] **FCFS Queue & Takeover Negotiation:** Refactor the `latchd` queue to operate on a First-Come-First-Served basis. Standard ticks must ask the current holder before taking over, waiting for a `latchd reply <host> yes|no --eta` response (or timing out after 15 minutes to ask the user).
 - [ ] **Incident Tick Supremacy:** Allow incident ticks to automatically take hosts from standard ticks without asking. Make hosts held by incident ticks strictly off-limits (no session can take them, and incident ticks are never asked to yield). Support multiple concurrent incident ticks.
 - [x] **Per-Tick Configuration:** Support `mcp_config`, `model`, and `effort` overrides per-tick in the configuration file to allow sharing resources.

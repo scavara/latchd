@@ -19,7 +19,7 @@ directives (block, warn, reserve, pause) that every session obeys.
 | `latch-run` | Rust | Runs one tick file as an agent session in a PTY, with a control socket and restart-on-change |
 | `latch-up` | Rust | Starts, stops, pauses and triggers ticks (`latch-up start all`, `latch-up status`) |
 | `latch-note` | Python 3 (stdlib only) | Session notes, heartbeats, directives, maintenance windows, rollouts, advisory feeds, the operator audit log (`latch-note said`), the pre-action maintenance check (`latch-note digest`), and the Claude Code hooks |
-| `dashboard/` (`latchboard`) | Rust + ratatui | Multi-panel terminal dashboard of claims, rollouts, runners, notices, host queues and directives (`--once` for plain text) |
+| `dashboard/` (`latchboard`) | Rust + ratatui | Multi-panel terminal dashboard of claims, rollouts, runners, notices, host queues, directives and maintenance, with panel focus keys and slash commands (`--once` for plain text) |
 | `start-ticks.sh` | bash + tmux | Orchestrates all active ticks and `latchboard` in a top-tabbed `tmux` session (`--restart`, `--stop`, `--status`) |
 
 See [OVERVIEW.md](OVERVIEW.md) for how the pieces fit together.
@@ -154,6 +154,18 @@ Early (`latchd` 0.3.x).
 ## Dashboard Overview
 
 ![Dashboard Preview](docs/assets/dashboard-preview.jpg)
+
+Keys: `d` `o` `m` `h` `w` `n` `r` `a` show one panel full-size (`j`/`k` scroll,
+`Esc` back), `q` quits, and `/` opens a command line:
+
+| Command | Effect |
+|---|---|
+| `/shutdown N` \| `<tick>` \| `all` | Stop the Nth runner listed, a tick by id, or all ticks |
+| `/close <rollout>` | Mark a rollout (id or name) as done |
+| `/help`, `/quit` | Show the commands; leave the dashboard |
+
+Commands that change something ask for `y` first and are carried out by
+`latch-up` and `latch-note`; the dashboard never writes state itself.
 
 ## Session Management
 

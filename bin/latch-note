@@ -1266,7 +1266,12 @@ def main() -> int:
         "nodes": cmd_nodes_check,
         "hook": cmd_hook,
     }
-    return dispatch[args.cmd](args)
+    try:
+        return dispatch[args.cmd](args)
+    except ValueError as exc:
+        # Bad references and time specs are user errors, not crashes.
+        sys.stderr.write(f"latch-note: {exc}\n")
+        return 1
 
 
 if __name__ == "__main__":

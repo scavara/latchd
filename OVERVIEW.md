@@ -118,8 +118,23 @@ request/response enums, and the duration parser (`15m`, `1h`, `2d`).
 ### dashboard (`dashboard/`)
 
 A separate cargo project (excluded from the workspace) that renders a ratatui
-terminal view of claims, rollouts, runners and notices. `--once` prints a plain
-snapshot instead, which is what the test suite uses.
+terminal view of claims, rollouts, runners, notices, directives and maintenance
+windows. `--once` prints a plain snapshot instead.
+
+A single key shows one panel full-size with `j`/`k` scrolling: `d` directives,
+`o` overview, `m` maintenance, `h` host queues, `w` runners (the watch ticks),
+`n` notices, plus `r` rollouts and `a` activity. The same key or `Esc` returns
+to the grid. `/` opens a command line:
+
+- `/shutdown N|<tick>|all` stops the Nth runner listed, a tick by id, or all
+  of them (`latch-up stop`).
+- `/close <rollout>` marks a rollout, by id or name, as done
+  (`latch-note rollout state <rollout> done`).
+- `/help`, `/quit`.
+
+Commands that change something ask for `y` first, and the dashboard itself
+stays read-only: every change goes through the CLI named above
+(`src/app.rs` holds the key and command logic, `src/main.rs` the drawing).
 
 ## State and configuration layout
 
@@ -138,5 +153,6 @@ snapshot instead, which is what the test suite uses.
 against scratch directories (nothing touches your real state). Suites cover
 claims, directives and maintenance windows, heartbeat sweeps, rollouts, hook
 refusal and notices, the runner lifecycle, the launcher and manifest tooling,
-the dashboard snapshot, the stale runner sweep, per-tick configuration, the
+the dashboard snapshot and its interactive commands (driven in tmux; skipped
+when tmux is missing), the stale runner sweep, per-tick configuration, the
 session audit log, the pre-action digest, and directive sync.
