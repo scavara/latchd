@@ -18,7 +18,7 @@ directives (block, warn, reserve, pause) that every session obeys.
 | `latchd` | Rust + SQLite | Claim/queue/take-grant store, directive checks, idle sweeper (`latchd daemon`) |
 | `latch-run` | Rust | Runs one tick file as an agent session in a PTY, with a control socket and restart-on-change |
 | `latch-up` | Rust | Starts, stops, pauses and triggers ticks (`latch-up start all`, `latch-up status`) |
-| `latch-note` | Python 3 (stdlib only) | Session notes, heartbeats, directives, maintenance windows, rollouts, advisory feeds, and the Claude Code hooks |
+| `latch-note` | Python 3 (stdlib only) | Session notes, heartbeats, directives, maintenance windows, rollouts, advisory feeds, the operator audit log (`latch-note said`), and the Claude Code hooks |
 | `dashboard/` (`latchboard`) | Rust + ratatui | Multi-panel terminal dashboard of claims, rollouts, runners, notices, host queues and directives (`--once` for plain text) |
 | `start-ticks.sh` | bash + tmux | Orchestrates all active ticks and `latchboard` in a top-tabbed `tmux` session (`--restart`, `--stop`, `--status`) |
 

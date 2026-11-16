@@ -72,6 +72,100 @@ def append_event(kind: str, details: dict) -> None:
         f.write(json.dumps(rec) + "\n")
 
 
+SAID_MAX_CHARS = 400
+
+
+def said_path() -> Path:
+    return handover_dir() / "said.jsonl"
+
+
+def record_said(kind: str, tick: str, text: str, **extra) -> None:
+    """Append one audit record: a prompt the operator submitted in a tick tab,
+    or an answer to a tick's question. Text is capped at SAID_MAX_CHARS."""
+    text = text.strip()
+    if not text:
+        return
+    rec = {"ts": now_epoch(), "tick": tick, "kind": kind, "text": text[:SAID_MAX_CHARS]}
+    if len(text) > SAID_MAX_CHARS:
+        rec["truncated"] = True
+        rec["chars"] = len(text)
+    rec.update(extra)
+    path = said_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Prompts can be sensitive: keep the log readable by its owner only.
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def tick_file_prompt() -> str:
+    """Prompt text of the tick this session runs (set by latch-run), or ''."""
+    tick_file = os.environ.get("LATCH_TICK_FILE")
+    if not tick_file:
+        return ""
+    try:
+        raw = Path(tick_file).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    lines = raw.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            return "\n".join(lines[i + 1:])
+    return ""
+
+
+def is_runner_prompt(text: str) -> bool:
+    """True for input latch-run sends by itself: the tick's own prompt and the
+    periodic `TICK <ts>` wake-ups. Those are not something the operator said."""
+    norm = " ".join(text.split())
+    if re.fullmatch(r"TICK \d+", norm):
+        return True
+    own = " ".join(tick_file_prompt().split())
+    return bool(own) and norm == own
+
+
+def cmd_said(args) -> int:
+    path = said_path()
+    records = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("ts"), int):
+                records.append(rec)
+    now = now_epoch()
+    if args.since:
+        cutoff = now - (parse_time_spec(args.since, 0))
+        records = [r for r in records if r["ts"] >= cutoff]
+    if args.tick:
+        records = [r for r in records if r.get("tick") == args.tick]
+    if args.kind:
+        records = [r for r in records if r.get("kind") == args.kind]
+    if args.last is not None:
+        records = records[-args.last:] if args.last > 0 else []
+    if args.json:
+        print(json.dumps(records, indent=2))
+        return 0
+    if not records:
+        print("nothing said")
+        return 0
+    for r in records:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"]))
+        text = " ".join(str(r.get("text", "")).split())
+        if r.get("truncated"):
+            text += f" [... {r.get('chars', '?')} chars]"
+        if r.get("kind") == "answer":
+            label = f"answer to #{r.get('question_id', '?')}"
+            if r.get("question"):
+                text = f"{text}  (Q: {' '.join(str(r['question']).split())})"
+        else:
+            label = str(r.get("kind", "prompt"))
+        print(f"{stamp}  {r.get('tick', '?')}  {label}: {text}")
+    return 0
+
+
 def parse_time_spec(spec: str, base: int) -> int:
     s = str(spec).strip()
     if s.isdigit():
@@ -300,17 +394,24 @@ def cmd_answered(args) -> int:
     asks_path = handover_dir() / "asks.json"
     asks = load_json_file(asks_path, [])
     qid = int(args.id)
-    found = False
+    found = None
     for a in asks:
         if a.get("id") == qid:
             a["answered_at"] = now_epoch()
             a["answer"] = args.answer or "acknowledged"
-            found = True
+            found = a
             break
-    if not found:
+    if found is None:
         sys.stderr.write(f"question #{qid} not found\n")
         return 1
     save_json_file(asks_path, asks)
+    record_said(
+        "answer",
+        str(found.get("tick_id") or "default"),
+        found["answer"],
+        question_id=qid,
+        question=str(found.get("question") or "")[:SAID_MAX_CHARS],
+    )
     append_event("answered", {"id": qid, "answer": args.answer})
     print(f"question #{qid} marked answered")
     return 0
@@ -693,6 +794,11 @@ def cmd_hook(args) -> int:
             else:
                 prompt_text = raw
         prompt_text = prompt_text or ""
+        # Audit only prompts submitted inside a tick session, never the
+        # operator's other agent sessions that happen to share these hooks.
+        in_tick = bool(args.session or os.environ.get("LATCH_SESSION"))
+        if in_tick and not is_runner_prompt(prompt_text):
+            record_said("prompt", session, prompt_text)
         rx = load_node_regex()
         for node in sorted(set(rx.findall(prompt_text))):
             subprocess.run(
@@ -763,6 +869,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ans = sub.add_parser("answered")
     p_ans.add_argument("id")
     p_ans.add_argument("answer", nargs="?", default="answered")
+
+    p_said = sub.add_parser("said", help="export prompts submitted in tick tabs and answers to tick questions")
+    p_said.add_argument("--tick", default=None, help="only this tick")
+    p_said.add_argument("--since", default=None, help="only the last 30m, 2h, 1d, ...")
+    p_said.add_argument("--kind", choices=["prompt", "answer"], default=None)
+    p_said.add_argument("-n", "--last", type=int, default=None, help="only the last N records")
+    p_said.add_argument("--json", action="store_true")
 
     p_roll = sub.add_parser("rollout")
     rsub = p_roll.add_subparsers(dest="rollout_cmd", required=True)
@@ -840,6 +953,7 @@ def main() -> int:
         "maintenance": cmd_maintenance,
         "ask": cmd_ask,
         "answered": cmd_answered,
+        "said": cmd_said,
         "rollout": cmd_rollout,
         "notices": lambda a: cmd_notices_ls(a) if a.notices_cmd == "ls" else cmd_notices_fetch(a),
         "nodes": cmd_nodes_check,

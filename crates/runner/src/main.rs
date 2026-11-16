@@ -437,6 +437,9 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
         ) == 0
     };
 
+    // Lets the agent's hooks tell the tick's own prompt from operator input.
+    let tick_file = fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
+
     let prio = if spec.role.as_deref() == Some("incident") {
         "9"
     } else {
@@ -455,6 +458,7 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
         cmd.args(&spec.agent_args)
             .env("LATCH_SESSION", &spec.tick_id)
             .env("LATCH_TITLE", &spec.title)
+            .env("LATCH_TICK_FILE", &tick_file)
             .env("LATCH_PRIO", prio)
             .stdin(slave_in)
             .stdout(slave_out)
@@ -487,6 +491,7 @@ fn spawn_session_pty(spec: &TickSpec) -> Result<(Child, FilePair), String> {
             .args(&spec.agent_args)
             .env("LATCH_SESSION", &spec.tick_id)
             .env("LATCH_TITLE", &spec.title)
+            .env("LATCH_TICK_FILE", &tick_file)
             .env("LATCH_PRIO", prio)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

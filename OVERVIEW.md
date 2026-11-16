@@ -61,6 +61,12 @@ agent and the rest of the system:
 - `directive`, `maintenance`: write operator directives (`directives.json`).
 - `send`, `inbox`, `ask`, `answered`: notes between sessions and questions to the
   operator.
+- `said [--tick T] [--since 2h] [--kind prompt|answer] [-n N] [--json]`:
+  exports the local audit log (`said.jsonl`) of what the operator told the
+  ticks: prompts submitted in a tick tab (recorded by the `prompt` hook, only
+  inside a tick session, and never the prompt or `TICK` wake-ups the runner
+  sends itself) and answers given with `answered`. Text is capped at 400
+  characters.
 - `heartbeat`: records the nodes a session is actively using so the sweeper
   leaves those claims alone.
 - `rollout start | mark | phase | note | state | ls | show`: tracks multi-step
@@ -119,4 +125,5 @@ snapshot instead, which is what the test suite uses.
 against scratch directories (nothing touches your real state). Suites cover
 claims, directives and maintenance windows, heartbeat sweeps, rollouts, hook
 refusal and notices, the runner lifecycle, the launcher and manifest tooling,
-the dashboard snapshot, the stale runner sweep, and per-tick configuration.
+the dashboard snapshot, the stale runner sweep, per-tick configuration, and
+the session audit log.
